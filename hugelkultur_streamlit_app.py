@@ -1,230 +1,177 @@
 # hugelkultur_viz_app.py
-# Streamlit app: DYNAMIC hügelkultur schematic with a real-rain time simulation (no graphs).
-# Fixes: uses placeholders (st.empty) + session_state so frames actually render during the loop.
+# A single-screen Streamlit app that dynamically updates a simple Hügelkultur schematic.
+# No charts/graphs — just a schematic that changes with user inputs.
 
-import math, time, random
+import math
 import numpy as np
 import streamlit as st
 import matplotlib.pyplot as plt
 
-# ---------- App setup ----------
+# =========================================================
+# 1. PAGE CONFIGURATION
+# =========================================================
 st.set_page_config(page_title="Dynamic Hügelkultur", layout="wide")
 st.title("Dynamic Hügelkultur (No Graphs)")
 
-# Keep a running flag in session_state
-if "run_id" not in st.session_state:
-    st.session_state.run_id = 0  # bump this to restart the loop
+# =========================================================
+# 2. SIDEBAR CONTROLS
+# =========================================================
 
-# ---------- Sidebar controls ----------
+# --- Rainfall & Catchment ---
 st.sidebar.header("Rainfall & Catchment")
-total_rain_mm = st.sidebar.slider("Total storm rain (mm)", 5, 300, 80, 5)
-duration_min  = st.sidebar.slider("Storm duration (minutes)", 5, 240, 40, 5)
-rain_shape    = st.sidebar.selectbox("Rain shape", ["Steady", "Front-loaded burst", "Back-loaded burst", "Pulsed"])
-randiness     = st.sidebar.slider("Intensity randomness (0–smooth, 1–chaotic)", 0.0, 1.0, 0.15, 0.05)
-A  = st.sidebar.number_input("Contributing area (m²)", min_value=10.0, value=300.0, step=10.0)
-CN = st.sidebar.slider("Curve Number (CN)", 55, 95, 85, 1, help="Higher CN ⇒ more runoff (e.g., compacted/roadside).")
+rainfall_mm = st.sidebar.slider("Storm rainfall (mm)", 10, 200, 60, 5)
+catchment_area_m2 = st.sidebar.number_input("Contributing area (m²)", min_value=10.0, value=300.0, step=10.0)
+curve_number = st.sidebar.slider(
+    "Curve Number (CN)", 55, 95, 85, 1,
+    help="Higher CN ⇒ more runoff (e.g., compacted soils or roads)."
+)
 
+# --- Mound Dimensions ---
 st.sidebar.header("Mound: Size & Sponge")
-mound_length = st.sidebar.number_input("Mound length (m)", 1.0, 50.0, 12.0, 1.0)
-mound_width0  = st.sidebar.number_input("Initial base width (m)", 0.5, 10.0, 2.0, 0.5)
-mound_height0 = st.sidebar.number_input("Initial height (m)", 0.3, 3.0, 1.5, 0.1)
-porosity0     = st.sidebar.slider("Wood/organic core porosity", 0.2, 0.9, 0.6, 0.05)
+mound_length_m = st.sidebar.number_input("Mound length (m)", 1.0, 50.0, 12.0, 1.0)
+mound_base_width_m = st.sidebar.number_input("Initial base width (m)", 0.5, 10.0, 2.0, 0.5)
+mound_height_m = st.sidebar.number_input("Initial height (m)", 0.3, 3.0, 1.5, 0.1)
+core_porosity = st.sidebar.slider("Wood/organic core porosity", 0.2, 0.9, 0.6, 0.05)
 
+# --- Aging Factors ---
 st.sidebar.header("Aging (Shrink/Settling)")
-half_life_years = st.sidebar.slider("Wood volume half-life (years)", 1, 15, 6, 1)
-extra_settle_5y = st.sidebar.slider("Extra settling over first 5y (%)", 0, 50, 15, 5)
-year_t          = st.sidebar.slider("Year", 0, 20, 0, 1)
+wood_half_life = st.sidebar.slider("Wood volume half-life (years)", 1, 15, 6, 1)
+extra_settling_pct = st.sidebar.slider("Extra settling over first 5y (%)", 0, 50, 15, 5)
+years_elapsed = st.sidebar.slider("Year", 0, 20, 0, 1)
 
-st.sidebar.header("Animation")
-ms_per_frame = st.sidebar.slider("Animation speed (ms per frame)", 40, 400, 140, 10)
-show_raindrop_rows = st.sidebar.checkbox("Show falling 💧 drops", True)
+# =========================================================
+# 3. HELPER FUNCTIONS
+# =========================================================
 
-# IMPORTANT: Use on_click to bump a run_id so Streamlit treats it as a new loop
-def _restart():
-    st.session_state.run_id += 1
-st.sidebar.button("▶️ Start / Replay Rain", on_click=_restart)
-
-# ---------- Helpers ----------
-def scs_runoff_mm(P_mm, CN):
-    S = (25400 / CN) - 254   # mm
+def scs_runoff(P_mm, CN):
+    """Compute runoff (mm) using SCS-CN method."""
+    S = (25400 / CN) - 254
     Ia = 0.2 * S
     if P_mm <= Ia:
         return 0.0
     Q = ((P_mm - Ia)**2) / (P_mm - Ia + S)
     return max(Q, 0.0)
 
-def initial_storage_m3(L, W, H, phi):
-    return 0.5 * W * H * L * phi  # triangular cross-section area * length * porosity
+def initial_storage(length, width, height, porosity):
+    """Initial storage capacity (m³) as triangular prism volume * porosity."""
+    cross_section_area = 0.5 * width * height
+    return cross_section_area * length * porosity
 
-def storage_at_year(S0, half_life, t_years, extra_settle_pct_5y):
-    lam = math.log(2) / half_life
-    decay = S0 * math.exp(-lam * t_years)
-    frac = extra_settle_pct_5y / 100.0
-    extra = (frac * S0) * (t_years/5.0) if t_years <= 5 else (frac * S0)
+def aged_storage(S0, half_life, years, extra_pct):
+    """Storage capacity at given year considering decay and settling."""
+    decay = S0 * math.exp(-math.log(2) * years / half_life)
+    extra = (extra_pct / 100) * S0 * min(years / 5, 1)
     return max(decay - extra, 0.0)
 
-def make_hyetograph(total_mm, minutes, shape="Steady", jitter=0.0, pulses=6):
-    t = np.linspace(0, 1, minutes)
-    if shape == "Steady":
-        base = np.ones_like(t)
-    elif shape == "Front-loaded burst":
-        base = (1 - t)**2.2 + 0.2
-    elif shape == "Back-loaded burst":
-        base = t**2.2 + 0.2
-    elif shape == "Pulsed":
-        base = np.ones_like(t) * 0.4
-        for k in range(1, pulses+1):
-            base += 0.35 * np.maximum(0, np.sin(np.pi * (k * t)))
-    else:
-        base = np.ones_like(t)
+# =========================================================
+# 4. CORE CALCULATIONS
+# =========================================================
 
-    base = np.clip(base, 0.05, None)
-    base = base / base.sum()
-    series = base * total_mm
+# Runoff depth and volume
+runoff_mm = scs_runoff(rainfall_mm, curve_number)
+runoff_m3 = (runoff_mm / 1000) * catchment_area_m2
 
-    if jitter > 0:
-        noise = np.random.normal(0, jitter, size=minutes)
-        series = np.clip(series * (1 + noise), 0, None)
-        series *= total_mm / max(series.sum(), 1e-9)
-    return series  # mm per minute
+# Mound capacity
+initial_capacity_m3 = initial_storage(mound_length_m, mound_base_width_m, mound_height_m, core_porosity)
+current_capacity_m3 = aged_storage(initial_capacity_m3, wood_half_life, years_elapsed, extra_settling_pct)
 
-def make_drop_frame(n_drops, width=(1,9), y_top=5.6, y_bot=1.8):
-    xs = np.linspace(width[0], width[1], n_drops) + np.random.uniform(-0.15, 0.15, n_drops)
-    ys = np.linspace(y_top, y_bot, n_drops) + np.random.uniform(-0.1, 0.1, n_drops)
-    return list(zip(xs, ys))
+# Water intercepted by mound
+intercepted_m3 = min(current_capacity_m3, runoff_m3)
 
-# ---------- Static mound capacity now ----------
-S0 = initial_storage_m3(mound_length, mound_width0, mound_height0, porosity0)
-S_t = storage_at_year(S0, half_life_years, year_t, extra_settle_5y)
+# Shrinking effect (visual)
+capacity_ratio = current_capacity_m3 / initial_capacity_m3 if initial_capacity_m3 > 0 else 0
+visual_height = max(0.2, mound_height_m * capacity_ratio**0.8)
+visual_width = max(0.4, mound_base_width_m * (0.8 + 0.2 * capacity_ratio))
 
-capacity_ratio = 0.0 if S0 == 0 else S_t / S0
-mound_height_t = max(0.2, mound_height0 * capacity_ratio**0.8)
-mound_width_t  = max(0.4, mound_width0  * (0.8 + 0.2 * capacity_ratio))
+# Fill level fraction
+fill_ratio = min(intercepted_m3 / current_capacity_m3, 1.0) if current_capacity_m3 > 0 else 0.0
 
-# ---------- UI placeholders (THIS is the key to make it show) ----------
-metrics_ph   = st.empty()
-subtitle_ph  = st.empty()
-figure_ph    = st.empty()
-caption_ph   = st.empty()
+# =========================================================
+# 5. METRICS DISPLAY
+# =========================================================
+col1, col2, col3, col4 = st.columns(4)
+col1.metric("Runoff depth (mm)", f"{runoff_mm:.1f}")
+col2.metric("Runoff volume (m³)", f"{runoff_m3:.1f}")
+col3.metric("Mound capacity (m³)", f"{current_capacity_m3:.1f}")
+col4.metric("Intercepted this storm (m³)", f"{intercepted_m3:.1f}")
 
-st.caption("Move the **Year** slider to see shrink/settling. Adjust rain total/duration/shape for realistic storms. "
-           "Change mound size/porosity to see a larger or smaller sponge.")
-st.markdown("---")
-
-# ---------- Draw one frame into the placeholder ----------
-def draw_frame(figure_placeholder, minute_idx, fill_ratio_frame, intercepted_m3, cum_runoff_m3, minutes):
-    subtitle_ph.subheader("Schematic (Not to Scale)")
-
-    fig, ax = plt.subplots(figsize=(11, 3.8))
-    # Ground
-    ax.plot([0, 10], [2, 2], linewidth=6)
-
-    # Mound geometry
-    cx = 5.0
-    left = cx - mound_width_t/2
-    right = cx + mound_width_t/2
-    peak_y = 2 + mound_height_t
-
-    # Outer mound
-    ax.fill([left, cx, right], [2, peak_y, 2], alpha=0.6)
-
-    # Inner core
-    inset = 0.12 * mound_width_t
-    left_in, right_in = left + inset, right - inset
-    peak_in_y = 2 + mound_height_t * 0.7
-    ax.fill([left_in, cx, right_in], [2, peak_in_y, 2], alpha=0.35)
-
-    # Water fill
-    if fill_ratio_frame > 0:
-        water_top_y = 2 + (peak_in_y - 2) * min(fill_ratio_frame, 1.0)
-        slope_left  = (peak_in_y - 2) / max(cx - left_in, 1e-9)
-        slope_right = (peak_in_y - 2) / max(right_in - cx, 1e-9)
-        xL = left_in + (water_top_y - 2) / slope_left
-        xR = right_in - (water_top_y - 2) / slope_right
-        ax.fill([xL, xR, right_in, left_in], [water_top_y, water_top_y, 2, 2], alpha=0.5)
-
-    # Drops
-    if show_raindrop_rows:
-        n = 12
-        for (x, y) in make_drop_frame(n):
-            ax.text(x, y, "💧", ha="center", va="center", fontsize=12)
-
-    # Infiltration arrows
-    for x in np.linspace(left+0.1, right-0.1, 3):
-        ax.annotate("", xy=(x, 2.15), xytext=(x, 2 + mound_height_t*0.75),
-                    arrowprops=dict(arrowstyle="-|>", lw=2))
-
-    # Labels
-    ax.text(cx, peak_y + 0.15, "mulch + soil", ha="center", fontsize=10)
-    ax.text(cx, 2 + mound_height_t*0.42, "wood/organic core\n('sponge')", ha="center", fontsize=10)
-    ax.text(0.8, 5.3, f"Year: {year_t}", fontsize=10)
-    ax.text(0.8, 4.9, f"Capacity now: {S_t:.1f} m³", fontsize=10)
-    ax.text(0.8, 4.5, f"Intercepted so far: {intercepted_m3:.1f} m³", fontsize=10)
-    ax.text(0.8, 4.1, f"Runoff so far: {cum_runoff_m3:.1f} m³", fontsize=10)
-    ax.text(0.8, 3.7, f"Minute {minute_idx+1} / {minutes}", fontsize=10)
-
-    ax.set_xlim(0, 10)
-    ax.set_ylim(1.6, 5.8)
-    ax.axis("off")
-
-    figure_placeholder.pyplot(fig)
-    plt.close(fig)
-
-def show_metrics(cumP, cum_runoff_m3, S_t, intercepted_m3):
-    with metrics_ph.container():
-        c1, c2, c3, c4 = st.columns(4)
-        c1.metric("Cumulative rain (mm)", f"{cumP:.1f}")
-        c2.metric("Runoff volume (m³)", f"{cum_runoff_m3:.1f}")
-        c3.metric("Mound capacity now (m³)", f"{S_t:.1f}")
-        c4.metric("Intercepted so far (m³)", f"{intercepted_m3:.1f}")
-
-# ---------- Simulation prep ----------
-minutes = int(duration_min)
-rain_series_mm = make_hyetograph(total_rain_mm, minutes, rain_shape, randiness)
-
-# Initial (dry) frame so there’s always something on screen
-show_metrics(0.0, 0.0, S_t, 0.0)
-draw_frame(figure_ph, 0, 0.0 if S_t == 0 else 0.0, 0.0, 0.0, minutes)
-caption_ph.caption(
-    "Picture-only dashboard: time-stepped rain drives SCS runoff minute-by-minute; the mound soaks it until capacity is filled."
+st.caption(
+    "Move the **Year** slider to see capacity loss over time. "
+    "Adjust rainfall, catchment area, or curve number to change runoff. "
+    "Change mound size or porosity to see different sponge capacities."
 )
 
-# ---------- Simulation loop (re-runs when run_id bumps) ----------
-# This loop renders to placeholders each iteration—so it SHOWS.
-current_run = st.session_state.run_id  # capture id at start of run
-if current_run > 0:
-    cumP = 0.0
-    cum_runoff_m3 = 0.0
-    intercepted_m3 = 0.0
-    filled_out = False
+st.markdown("---")
 
-    for i in range(minutes):
-        # If user pressed the button again mid-run, stop this loop (new run will start)
-        if st.session_state.run_id != current_run:
-            break
+# =========================================================
+# 6. SCHEMATIC VISUALIZATION
+# =========================================================
+st.subheader("Schematic (Not to Scale)")
+fig, ax = plt.subplots(figsize=(11, 3.8))
 
-        dP = float(rain_series_mm[i])
-        prevP = cumP
-        cumP += dP
+# Ground line
+ax.plot([0, 10], [2, 2], linewidth=6, color="saddlebrown")
 
-        Q_prev = scs_runoff_mm(prevP, CN)
-        Q_curr = scs_runoff_mm(cumP, CN)
-        dQ = max(Q_curr - Q_prev, 0.0)
+# Position parameters
+center_x = 5
+left_x = center_x - visual_width / 2
+right_x = center_x + visual_width / 2
+peak_y = 2 + visual_height
 
-        dV = (dQ / 1000.0) * A
-        cum_runoff_m3 += dV
+# Outer mound
+ax.fill([left_x, center_x, right_x], [2, peak_y, 2], color="peru", alpha=0.6)
 
-        if not filled_out and S_t > 0:
-            free_cap = max(S_t - intercepted_m3, 0.0)
-            take = min(free_cap, dV)
-            intercepted_m3 += take
-            filled_out = intercepted_m3 >= S_t - 1e-9
+# Inner core (wood/organic matter)
+inset = 0.12 * visual_width
+inner_left = left_x + inset
+inner_right = right_x - inset
+inner_peak_y = 2 + visual_height * 0.7
+ax.fill([inner_left, center_x, inner_right], [2, inner_peak_y, 2], color="sienna", alpha=0.35)
 
-        fill_ratio = 0.0 if S_t == 0 else min(intercepted_m3 / S_t, 1.0)
-        show_metrics(cumP, cum_runoff_m3, S_t, intercepted_m3)
-        draw_frame(figure_ph, i, fill_ratio, intercepted_m3, cum_runoff_m3, minutes)
+# Water fill (blue)
+if fill_ratio > 0:
+    water_level_y = 2 + (inner_peak_y - 2) * fill_ratio
+    slope_left = (inner_peak_y - 2) / (center_x - inner_left)
+    slope_right = (inner_peak_y - 2) / (inner_right - center_x)
+    x_left = inner_left + (water_level_y - 2) / slope_left
+    x_right = inner_right - (water_level_y - 2) / slope_right
+    ax.fill([x_left, x_right, inner_right, inner_left],
+            [water_level_y, water_level_y, 2, 2],
+            color="deepskyblue", alpha=0.5)
 
-        time.sleep(ms_per_frame / 1000.0)
+# Raindrops above
+n_drops = int(np.interp(rainfall_mm, [10, 200], [6, 18]))
+for x in np.linspace(1, 9, n_drops):
+    ax.text(x, 5.4, "💧", ha="center", va="center", fontsize=12)
+
+# Infiltration arrows
+for x in np.linspace(left_x + 0.1, right_x - 0.1, 3):
+    ax.annotate("", xy=(x, 2.15), xytext=(x, 2 + visual_height * 0.75),
+                arrowprops=dict(arrowstyle="-|>", lw=2))
+
+# Labels
+ax.text(center_x, peak_y + 0.15, "mulch + soil", ha="center", fontsize=10)
+ax.text(center_x, 2 + visual_height * 0.42, "wood/organic core\n('sponge')", ha="center", fontsize=10)
+
+# Capacity info
+ax.text(0.8, 5.1, f"Year: {years_elapsed}", fontsize=10)
+ax.text(0.8, 4.7, f"Capacity now: {current_capacity_m3:.1f} m³", fontsize=10)
+ax.text(0.8, 4.3, f"Intercepted: {intercepted_m3:.1f} m³", fontsize=10)
+
+# Final layout
+ax.set_xlim(0, 10)
+ax.set_ylim(1.6, 5.8)
+ax.axis("off")
+
+st.pyplot(fig)
+
+# =========================================================
+# 7. FOOTER
+# =========================================================
+st.caption(
+    "This schematic dynamically updates with your inputs. "
+    "The mound shrinks as capacity declines; the blue area shows intercepted water from this storm."
+)
 
 
 
