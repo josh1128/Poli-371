@@ -1,5 +1,3 @@
 ﻿streamlit
 matplotlib
-time
 numpy
-random
