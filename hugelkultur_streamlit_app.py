@@ -1,157 +1,160 @@
-# hugelkultur_dynamic_app.py
-# Streamlit dashboard to visualize how a hügelkultur mound's storage and runoff interception change over time.
+# hugelkultur_viz_app.py
+# A single-screen Streamlit app that DYNAMICALLY updates a simple hügelkultur schematic.
+# No charts/graphs — just a picture that changes with your inputs.
 
 import math
 import numpy as np
 import streamlit as st
 import matplotlib.pyplot as plt
 
-# ----------------------------
-# App config & title
-# ----------------------------
-st.set_page_config(page_title="Hügelkultur Dynamics", layout="wide")
-st.title("Hügelkultur Dynamics")
-st.caption("Adjust parameters and see how mound storage and storm interception evolve over time.")
+# ---------- App setup ----------
+st.set_page_config(page_title="Dynamic Hügelkultur", layout="wide")
+st.title("Dynamic Hügelkultur (No Graphs)")
 
-# ----------------------------
-# Sidebar Controls
-# ----------------------------
+# ---------- Sidebar controls ----------
 st.sidebar.header("Rainfall & Catchment")
-P = st.sidebar.slider("Storm rainfall P (mm)", 10, 200, 60, 5)
-A = st.sidebar.number_input("Contributing area A (m²)", min_value=10.0, value=500.0, step=10.0)
-CN = st.sidebar.slider("Curve Number (CN)", 55, 95, 85, 1, help="Higher CN ⇒ more runoff (e.g., compacted surfaces).")
+P = st.sidebar.slider("Storm rainfall (mm)", 10, 200, 60, 5)
+A = st.sidebar.number_input("Contributing area (m²)", min_value=10.0, value=300.0, step=10.0)
+CN = st.sidebar.slider("Curve Number (CN)", 55, 95, 85, 1, help="Higher CN ⇒ more runoff (e.g., compacted/roadside).")
 
-st.sidebar.header("Mound Geometry & Properties")
-mound_length = st.sidebar.number_input("Mound length (m)", 1.0, 50.0, 15.0, 1.0)
-mound_width  = st.sidebar.number_input("Mound base width (m)", 0.5, 10.0, 2.0, 0.5)
-mound_height0 = st.sidebar.number_input("Initial mound height (m)", 0.3, 3.0, 1.5, 0.1)
-wood_porosity = st.sidebar.slider("Effective porosity of wood core (0–1)", 0.2, 0.9, 0.6, 0.05)
+st.sidebar.header("Mound: Size & Sponge")
+mound_length = st.sidebar.number_input("Mound length (m)", 1.0, 50.0, 12.0, 1.0)
+mound_width0  = st.sidebar.number_input("Initial base width (m)", 0.5, 10.0, 2.0, 0.5)
+mound_height0 = st.sidebar.number_input("Initial height (m)", 0.3, 3.0, 1.5, 0.1)
+porosity0     = st.sidebar.slider("Wood/organic core porosity", 0.2, 0.9, 0.6, 0.05)
 
-st.sidebar.header("Decomposition / Settling")
+st.sidebar.header("Aging (Shrink/Settling)")
 half_life_years = st.sidebar.slider("Wood volume half-life (years)", 1, 15, 6, 1)
-settling_frac_extra = st.sidebar.slider("Extra settling over 5y (%)", 0, 50, 15, 5,
-                                        help="Additional storage loss not from decomposition (soil collapse/compaction).")
-years = st.sidebar.slider("Years to simulate", 1, 30, 12, 1)
+extra_settle_5y = st.sidebar.slider("Extra settling over first 5y (%)", 0, 50, 15, 5)
+year_t = st.sidebar.slider("Year", 0, 20, 0, 1)
 
-# ----------------------------
-# Helper functions
-# ----------------------------
-def scs_runoff_mm(P_mm: float, CN: int) -> float:
-    """NRCS/SCS runoff (mm) from storm depth P (mm)."""
-    S = (25400 / CN) - 254   # potential max retention (mm)
-    Ia = 0.2 * S             # initial abstraction (mm)
+# ---------- Helpers ----------
+def scs_runoff_mm(P_mm, CN):
+    S = (25400 / CN) - 254   # mm
+    Ia = 0.2 * S
     if P_mm <= Ia:
         return 0.0
-    Q = ((P_mm - Ia) ** 2) / (P_mm - Ia + S)
+    Q = ((P_mm - Ia)**2) / (P_mm - Ia + S)
     return max(Q, 0.0)
 
-def mound_initial_storage_m3(length_m: float, width_m: float, height_m: float, porosity: float) -> float:
-    """Approximate sponge-like storage from a triangular cross-section times length and porosity."""
-    cross_area = 0.5 * width_m * height_m   # triangle area
-    bulk_vol = cross_area * length_m
-    return bulk_vol * porosity
+def initial_storage_m3(L, W, H, phi):
+    # triangular cross-section area * length * porosity
+    cross_area = 0.5 * W * H
+    return cross_area * L * phi
 
-def decay_series(initial_value: float, half_life: float, years: int, extra_settling_frac_5y: float = 0.0) -> np.ndarray:
-    """Exponential decay for wood storage with a linear extra-settling loss over first 5 years."""
-    t = np.arange(0, years + 1, 1)
+def storage_at_year(S0, half_life, t_years, extra_settle_pct_5y):
     lam = math.log(2) / half_life
-    decay_vals = initial_value * np.exp(-lam * t)
+    decay = S0 * math.exp(-lam * t_years)
+    # linear extra settling up to 5y, then flat
+    extra = 0.0
+    frac = extra_settle_pct_5y / 100.0
+    if t_years <= 5:
+        extra = (frac * S0) * (t_years / 5.0)
+    else:
+        extra = frac * S0
+    S = max(decay - extra, 0.0)
+    return S
 
-    extra = np.zeros_like(t, dtype=float)
-    if years > 0 and extra_settling_frac_5y > 0:
-        frac = extra_settling_frac_5y / 100.0
-        ramp_years = min(5, years)
-        ramp = np.linspace(0, frac * initial_value, ramp_years + 1)  # 0 → frac*initial over 5y
-        extra[:ramp_years + 1] = ramp
-        if years > ramp_years:
-            extra[ramp_years + 1:] = frac * initial_value
+# ---------- Core calculations ----------
+Q_mm = scs_runoff_mm(P, CN)
+runoff_m3 = (Q_mm / 1000.0) * A
 
-    values = decay_vals - extra
-    values[values < 0] = 0.0
-    return values
+S0 = initial_storage_m3(mound_length, mound_width0, mound_height0, porosity0)
+S_t = storage_at_year(S0, half_life_years, year_t, extra_settle_5y)
 
-# ----------------------------
-# Core calculations
-# ----------------------------
-Q_mm = scs_runoff_mm(P, CN)          # runoff depth in mm
-runoff_m3 = (Q_mm / 1000.0) * A      # event runoff volume (m³)
+# For a single storm, how much could the mound intercept right now?
+intercept_m3 = min(S_t, runoff_m3)
 
-initial_storage_m3 = mound_initial_storage_m3(mound_length, mound_width, mound_height0, wood_porosity)
-storage_time_series = decay_series(initial_storage_m3, half_life_years, years, settling_frac_extra)
-intercepted_series = np.minimum(storage_time_series, runoff_m3)
+# Scale the mound’s apparent dimensions with capacity loss (purely visual)
+capacity_ratio = 0.0 if S0 == 0 else S_t / S0
+mound_height_t = max(0.2, mound_height0 * capacity_ratio**0.8)  # soften shrink visually
+mound_width_t  = max(0.4, mound_width0  * (0.8 + 0.2 * capacity_ratio))  # width shrinks less
 
-# ----------------------------
-# Metrics
-# ----------------------------
-colM1, colM2, colM3 = st.columns(3)
-colM1.metric("Runoff depth Q (mm)", f"{Q_mm:.1f}")
-colM2.metric("Event runoff (m³)", f"{runoff_m3:.1f}")
-colM3.metric("Initial mound storage (m³)", f"{initial_storage_m3:.1f}")
+# “Fill level” inside the mound to reflect this storm’s intercepted fraction
+fill_ratio = 0.0 if S_t == 0 else min(intercept_m3 / S_t, 1.0)
 
-st.markdown("---")
+# ---------- Metrics (text only, no graphs) ----------
+c1, c2, c3, c4 = st.columns(4)
+c1.metric("Runoff depth (mm)", f"{Q_mm:.1f}")
+c2.metric("Runoff volume (m³)", f"{runoff_m3:.1f}")
+c3.metric("Mound capacity now (m³)", f"{S_t:.1f}")
+c4.metric("Intercepted this storm (m³)", f"{intercept_m3:.1f}")
 
-# ----------------------------
-# Charts
-# ----------------------------
-col1, col2 = st.columns([1, 1])
-
-with col1:
-    st.subheader("Storage Decline Over Time")
-    fig1, ax1 = plt.subplots(figsize=(6, 3.6))
-    ax1.plot(np.arange(0, years + 1), storage_time_series, linewidth=2)
-    ax1.set_xlabel("Year")
-    ax1.set_ylabel("Mound Storage (m³)")
-    ax1.grid(True, alpha=0.2)
-    st.pyplot(fig1)
-
-with col2:
-    st.subheader("Intercepted Volume for This Storm Over Time")
-    fig2, ax2 = plt.subplots(figsize=(6, 3.6))
-    ax2.plot(np.arange(0, years + 1), intercepted_series, linewidth=2)
-    ax2.set_xlabel("Year")
-    ax2.set_ylabel("Intercepted Volume (m³)")
-    ax2.grid(True, alpha=0.2)
-    st.pyplot(fig2)
+st.caption("Move the **Year** slider to see shrink/settling. Adjust rainfall/area/CN to change incoming runoff. "
+           "Change mound size/porosity to see a larger or smaller sponge.")
 
 st.markdown("---")
 
-# ----------------------------
-# Simple Schematic (Not to Scale)
-# ----------------------------
+# ---------- Single schematic that updates ----------
 st.subheader("Schematic (Not to Scale)")
-fig3, ax3 = plt.subplots(figsize=(9, 3.2))
 
-# Ground
-ax3.plot([0, 10], [2, 2], linewidth=3)
+fig, ax = plt.subplots(figsize=(11, 3.8))
 
-# Mound as triangle scaled to sidebar inputs
-height = max(mound_height0, 0.1)
-width = max(mound_width, 0.5)
-left = 5 - width / 2
-right = 5 + width / 2
-ax3.fill([left, 5, right], [2, 2 + height, 2], alpha=0.6)
+# Ground line
+ax.plot([0, 10], [2, 2], linewidth=6)
 
-# Raindrops
-for x in np.linspace(1, 9, 10):
-    ax3.text(x, 5.0, "💧", ha="center", va="center", fontsize=10)
+# Center position for mound
+center_x = 5.0
+left = center_x - mound_width_t/2
+right = center_x + mound_width_t/2
+peak_y = 2 + mound_height_t
 
-# Infiltration arrows
-for x in np.linspace(left + 0.2, right - 0.2, 4):
-    ax3.annotate("", xy=(x, 2.05), xytext=(x, 2 + height * 0.7),
-                 arrowprops=dict(arrowstyle="-|>", lw=1.8))
+# Outer mound polygon (soil + mulch)
+ax.fill([left, center_x, right], [2, peak_y, 2], alpha=0.6)
 
-# Labels
-ax3.text(5, 2 + height * 0.83, "mulch + soil", ha="center", fontsize=9)
-ax3.text(5, 2 + height * 0.45, "wood/organic core\n('sponge')", ha="center", fontsize=9)
+# Inner “sponge” core (draw as a slightly inset triangle)
+inset = 0.12 * mound_width_t
+left_in  = left + inset
+right_in = right - inset
+peak_in_y = 2 + mound_height_t * 0.7
+ax.fill([left_in, center_x, right_in], [2, peak_in_y, 2], alpha=0.35)
 
-ax3.set_xlim(0, 10)
-ax3.set_ylim(1.5, 5.5)
-ax3.axis("off")
-st.pyplot(fig3)
+# Water fill inside the core to show THIS STORM interception
+if fill_ratio > 0:
+    # Draw a horizontal water line within the inner core
+    water_top_y = 2 + (peak_in_y - 2) * fill_ratio
+    # Compute intersection points with inner triangle sides to draw a filled trapezoid
+    # Left side line: (x from left_in to center_x)
+    # y = 2 + ( (peak_in_y-2)/(center_x-left_in) ) * (x-left_in)
+    # Solve for x where y = water_top_y
+    slope_left = (peak_in_y - 2) / (center_x - left_in) if center_x != left_in else 1e9
+    xL = left_in + (water_top_y - 2) / slope_left
 
-# ----------------------------
-# Footer
-# ----------------------------
-st.caption("Educational tool. For engineering design, consult local standards.")
+    # Right side
+    slope_right = (peak_in_y - 2) / (right_in - center_x) if right_in != center_x else 1e9
+    xR = right_in - (water_top_y - 2) / slope_right
+
+    # Fill polygon for water (simple trapezoid)
+    ax.fill([xL, xR, right_in, left_in], [water_top_y, water_top_y, 2, 2], alpha=0.5)
+
+# Raindrops row: number reflects rainfall intensity
+n_drops = int(np.interp(P, [10, 200], [6, 18]))
+for x in np.linspace(1, 9, n_drops):
+    ax.text(x, 5.4, "💧", ha="center", va="center", fontsize=12)
+
+# Downward infiltration arrows over mound
+for x in np.linspace(left+0.1, right-0.1, 3):
+    ax.annotate("", xy=(x, 2.15), xytext=(x, 2 + mound_height_t*0.75),
+                arrowprops=dict(arrowstyle="-|>", lw=2))
+
+# Labels that change with year/capacity
+ax.text(center_x, peak_y + 0.15, "mulch + soil", ha="center", fontsize=10)
+ax.text(center_x, 2 + mound_height_t*0.42, "wood/organic core\n('sponge')", ha="center", fontsize=10)
+
+# Capacity label
+ax.text(0.8, 5.1, f"Year: {year_t}", fontsize=10)
+ax.text(0.8, 4.7, f"Capacity now: {S_t:.1f} m³", fontsize=10)
+ax.text(0.8, 4.3, f"Intercepted this storm: {intercept_m3:.1f} m³", fontsize=10)
+
+ax.set_xlim(0, 10)
+ax.set_ylim(1.6, 5.8)
+ax.axis("off")
+st.pyplot(fig)
+
+st.caption(
+    "Picture-only dashboard: the mound shrinks as capacity declines with age; blue fill shows how much of THIS storm "
+    "the mound can soak up today. No charts are shown."
+)
+
 
 
