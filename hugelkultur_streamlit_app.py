@@ -1,14 +1,16 @@
 # hugelkultur_viz_app.py
-# Dynamic Hügelkultur schematic with REALISTIC rain:
-# - Parallax rain layers (far/mid/near) with different speeds & lengths
-# - Gravity acceleration + wind gusts
-# - Impact splashes (short-lived fans)
-# - Rising water in mound via SCS-CN runoff (no charts)
+# Dynamic Hügelkultur schematic with REALISTIC rain and bottom HUD.
+# - Parallax rain layers (far/mid/near) with gravity & wind gusts
+# - Impact splashes that fade
+# - SCS-CN runoff minute-by-minute; mound fills until capacity
+# - HUD (Year/Capacity/Intercepted/Runoff/Minute) at bottom-left
+# - Single schematic only (no charts)
 
 import math, time, random
 import numpy as np
 import streamlit as st
 import matplotlib.pyplot as plt
+from matplotlib import patches
 
 # -------------------- Page setup --------------------
 st.set_page_config(page_title="Dynamic Hügelkultur", layout="wide")
@@ -99,10 +101,7 @@ metrics_ph, title_ph, fig_ph, footer_ph = st.empty(), st.empty(), st.empty(), st
 
 # -------------------- Realistic rain system ----------
 class RainLayer:
-    """
-    A parallax layer of slanted rain streaks with gravity & wind.
-    Each drop is a short line segment; length scales with speed.
-    """
+    """Parallax layer of slanted rain streaks with gravity & wind."""
     def __init__(self, n, speed_range, length_range, alpha, linew, z_wind=1.0):
         self.n = n
         self.alpha = alpha
@@ -114,9 +113,7 @@ class RainLayer:
         self.len = np.random.uniform(*length_range, n)
 
     def step(self, wind, accel=0.0015):
-        # gravity accelerates vertical speed slightly
-        self.v += accel
-        # wind with depth factor
+        self.v += accel  # gravity
         dx = (wind*self.z_wind)*0.06
         self.x += dx + np.random.normal(0, 0.004, self.n)
         self.y -= self.v
@@ -124,33 +121,29 @@ class RainLayer:
         mask = self.y < 2.05
         self.y[mask] = np.random.uniform(5.8, 6.3, mask.sum())
         self.x[mask] = np.random.uniform(0.6, 9.4, mask.sum())
-        # prepare streak endpoints (slanted by wind)
+        # streak endpoints (slanted)
         x0 = self.x
         y0 = self.y
         x1 = self.x - (self.len*wind*0.4)
         y1 = self.y + self.len
-        return x0,y0,x1,y1
+        return x0,y0,x1,y1,mask
 
 class SplashField:
-    """
-    Short-lived splash 'fans' spawned when drops hit ground.
-    Each splash is a few tiny segments arcing upward, fading out.
-    """
-    def __init__(self, capacity=300):
+    """Short-lived splash fans spawned on ground impact."""
+    def __init__(self, capacity=400):
         self.capacity = capacity
         self.alive = np.zeros(capacity, dtype=bool)
         self.x = np.zeros(capacity); self.y = np.zeros(capacity)
         self.age = np.zeros(capacity); self.max_age = np.zeros(capacity)
-        self.spokes = [None]*capacity  # list of (dx0,dy0,dx1,dy1) per splash
+        self.spokes = [None]*capacity  # per splash: (dx0,dy0,dx1,dy1)
 
     def spawn(self, x, n_spokes=5):
-        # find slot
         idx = np.where(~self.alive)[0]
         if len(idx)==0: return
         i = idx[0]
         self.alive[i]=True
         self.x[i]=x; self.y[i]=2.05
-        self.age[i]=0.0; self.max_age[i]=random.uniform(8,14)  # frames
+        self.age[i]=0.0; self.max_age[i]=random.uniform(8,14)
         angles = np.linspace(np.pi*0.9, np.pi*0.1, n_spokes) + np.random.normal(0,0.05,n_spokes)
         r0 = np.random.uniform(0.02, 0.06, n_spokes)
         r1 = r0 + np.random.uniform(0.03, 0.08, n_spokes)
@@ -158,8 +151,7 @@ class SplashField:
                                    r1*np.cos(angles), r1*np.sin(angles)], axis=1)
 
     def step(self):
-        segs = []
-        alphas = []
+        segs = []; alphas = []
         for i in np.where(self.alive)[0]:
             self.age[i] += 1
             fade = max(0.0, 1.0 - self.age[i]/self.max_age[i])
@@ -174,7 +166,6 @@ class SplashField:
 class RainSystem:
     """Three parallax layers + splash field; returns streaks & splashes for drawing."""
     def __init__(self, density, base_wind, gustiness):
-        # distribute density across layers
         n_far  = max(6, int(density*0.35))
         n_mid  = max(8, int(density*0.45))
         n_near = max(6, int(density*0.30))
@@ -190,26 +181,21 @@ class RainSystem:
         self._t = 0
 
     def _wind_now(self):
-        # smooth gusts
         self._t += 1
-        # low-frequency noise using sin + small random walk
+        # smooth gusts (sine + small random walk)
         self._gust = 0.92*self._gust + 0.08*np.sin(self._t*0.07) + np.random.normal(0,0.01)
         return self.base_wind + self.gustiness*self._gust
 
     def step(self):
         wind = self._wind_now()
         streaks = []
-        # step each layer and collect streak segments
         for layer in self.layers:
-            x0,y0,x1,y1 = layer.step(wind)
-            # any hits at ground? spawn splashes
-            hits = y0 < 2.06
-            if np.any(hits):
-                for x in x0[hits]:
-                    if 0.9 <= x <= 9.1:  # only spawn within viewport
+            x0,y0,x1,y1,hits_mask = layer.step(wind)
+            if np.any(hits_mask):
+                for x in x0[hits_mask]:
+                    if 0.9 <= x <= 9.1:
                         self.splashes.spawn(float(x), n_spokes=random.randint(4,6))
             streaks.append((x0,y0,x1,y1, layer.alpha, layer.linew))
-        # step splashes
         splash_segs, splash_alpha = self.splashes.step()
         return streaks, splash_segs, splash_alpha
 
@@ -254,15 +240,30 @@ def draw_frame(min_i, fill_ratio, cumP, cum_runoff_m3, intercepted_m3, minutes,
         a = splash_alpha[k]
         ax.plot([sx0,sx1],[sy0,sy1], color="#1f77b4", alpha=a, linewidth=1.2)
 
-    # Labels / HUD
+    # Labels (static)
     ax.text(cx, peak_y+0.18, "mulch + soil", ha="center", fontsize=10)
     ax.text(cx, 2 + H_t*0.42, "wood/organic core\n('sponge')", ha="center", fontsize=10)
-    ax.text(0.8, 5.45, f"Year: {year_t}", fontsize=10)
-    ax.text(0.8, 5.05, f"Capacity now: {S_t:.1f} m³", fontsize=10)
-    ax.text(0.8, 4.65, f"Intercepted: {intercepted_m3:.1f} m³", fontsize=10)
-    ax.text(0.8, 4.25, f"Runoff: {cum_runoff_m3:.1f} m³", fontsize=10)
-    ax.text(0.8, 3.85, f"Minute {min_i+1} / {minutes}", fontsize=10)
 
+    # --------- Bottom HUD (with translucent background) ----------
+    # Background panel
+    panel_x, panel_y = 0.6, 2.08     # near bottom-left
+    panel_w, panel_h = 3.1, 1.65     # width/height in data coords
+    rect = patches.FancyBboxPatch(
+        (panel_x, panel_y), panel_w, panel_h,
+        boxstyle="round,pad=0.08,rounding_size=0.06",
+        linewidth=0, facecolor=(1,1,1,0.45))
+    ax.add_patch(rect)
+
+    # Text lines stacked upward from panel_y
+    base_y = panel_y + 0.18
+    gap = 0.30
+    ax.text(panel_x+0.18, base_y + 4*gap, f"Year: {year_t}", fontsize=10, va="bottom")
+    ax.text(panel_x+0.18, base_y + 3*gap, f"Capacity now: {S_t:.1f} m³", fontsize=10, va="bottom")
+    ax.text(panel_x+0.18, base_y + 2*gap, f"Intercepted: {intercepted_m3:.1f} m³", fontsize=10, va="bottom")
+    ax.text(panel_x+0.18, base_y + 1*gap, f"Runoff: {cum_runoff_m3:.1f} m³", fontsize=10, va="bottom")
+    ax.text(panel_x+0.18, base_y + 0*gap, f"Minute {min_i+1} / {minutes}", fontsize=10, va="bottom")
+
+    # Axes
     ax.set_xlim(0,10); ax.set_ylim(1.6,6.0); ax.axis("off")
     fig_ph.pyplot(fig); plt.close(fig)
 
@@ -279,7 +280,7 @@ minutes = int(duration_min)
 series = hyetograph(total_rain_mm, minutes, rain_shape, randiness)
 show_metrics(0.0,0.0,0.0)
 draw_frame(0,0.0,0.0,0.0,0.0,minutes, [], [], [])
-footer_ph.caption("Press ▶️ Start / Replay. Raindrops are slanted streaks with wind & gravity; splashes appear on impact.")
+footer_ph.caption("Press ▶️ Start / Replay. Raindrops are slanted streaks with wind & gravity; splashes appear on impact. HUD is at the bottom.")
 
 # -------------------- Animation loop ----------------
 current_run = st.session_state.run_id
@@ -291,7 +292,7 @@ if current_run>0:
 
     rain = RainSystem(rain_intensity, base_wind, gustiness)
     frame_dt = 1.0/fps
-    subframes = max(1, int(fps*0.6))  # ~0.6 s per "minute" of storm visually
+    subframes = max(1, int(fps*0.6))  # ~0.6 s per "minute" visually
 
     for minute in range(minutes):
         if st.session_state.run_id != current_run: break
