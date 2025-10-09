@@ -1,44 +1,40 @@
-# hugelkultur_map_impact.py
-# Streamlit app to visualize Hügelkultur impact on runoff at Rwabutenge (Gahanga Sector, Kicukiro, Kigali)
+# hugelkultur_map_impact_free.py
+# Streamlit app: Hügelkultur impact simulation at HOPE Rwanda site (Rwabutenge, Gahanga Sector, Kicukiro)
 
-import math, time, random
+import math, time
 import numpy as np
 import streamlit as st
 import matplotlib.pyplot as plt
 from matplotlib import patches
-import pydeck as pdk
+import folium
+from streamlit_folium import st_folium
 
 # -------------------- Page setup --------------------
-st.set_page_config(page_title="Hügelkultur Impact – HOPE Rwanda Site", layout="wide")
+st.set_page_config(page_title="Hügelkultur Impact – HOPE Rwanda", layout="wide")
 st.title("💧 Hügelkultur Impact Simulation – HOPE Rwanda Site (Rwabutenge, Gahanga, Kicukiro)")
 
-# -------------------- Map ---------------------------
+# -------------------- Free Map (OpenStreetMap) --------------------
 SITE_LAT, SITE_LON = -2.0344, 30.1318
+
 with st.expander("🗺️ View Project Site Map", expanded=True):
-    zoom = st.slider("Map zoom", 8, 16, 12)
-    view_state = pdk.ViewState(latitude=SITE_LAT, longitude=SITE_LON, zoom=zoom, pitch=30)
-    layer = pdk.Layer(
-        "ScatterplotLayer",
-        data=[{"lat": SITE_LAT, "lon": SITE_LON, "name": "HOPE Rwanda Site"}],
-        get_position="[lon, lat]",
-        get_radius=150,
-        get_fill_color=[255, 0, 0, 160],
-        pickable=True,
-    )
-    tooltip = {"html": "<b>{name}</b><br/>Rwabutenge, Gahanga Sector, Kicukiro District"}
-    st.pydeck_chart(
-        pdk.Deck(map_style="mapbox://styles/mapbox/outdoors-v12",
-                 initial_view_state=view_state,
-                 layers=[layer],
-                 tooltip=tooltip),
-        use_container_width=True
-    )
+    m = folium.Map(location=[SITE_LAT, SITE_LON], zoom_start=14, tiles="OpenStreetMap")
+    folium.Marker(
+        [SITE_LAT, SITE_LON],
+        popup="HOPE Rwanda Project Site – Rwabutenge, Gahanga Sector",
+        tooltip="Click for details",
+        icon=folium.Icon(color="red", icon="tint")
+    ).add_to(m)
+    folium.LayerControl().add_to(m)
+    st_folium(m, width=700, height=450)
 
 st.markdown(
-    "This simulation compares **runoff vs intercepted water** for a storm event at the HOPE Rwanda site."
+    """
+    This tool simulates a **rainfall event** and compares **runoff** with and without a Hügelkultur mound.
+    The mound stores rainwater like a sponge, reducing surface runoff and erosion.
+    """
 )
 
-# -------------------- Controls ----------------------
+# -------------------- Sidebar Controls ----------------------
 st.sidebar.header("🌧️ Storm Parameters")
 total_rain_mm = st.sidebar.slider("Total storm rain (mm)", 5, 300, 120, 5)
 duration_min = st.sidebar.slider("Storm duration (minutes)", 5, 240, 60, 5)
@@ -55,12 +51,11 @@ st.sidebar.header("🧮 Catchment & Soil")
 A = st.sidebar.number_input("Contributing area (m²)", 10.0, 10000.0, 300.0, 10.0)
 CN = st.sidebar.slider("Curve Number (CN)", 55, 95, 85, 1)
 
-fps = st.sidebar.slider("Frames per second", 5, 30, 20)
-rain_density = st.sidebar.slider("Visual rain density", 10, 150, 60)
+fps = st.sidebar.slider("Frames per second", 5, 30, 15)
 
-# -------------------- Helper functions --------------
+# -------------------- Hydrology Functions --------------------
 def scs_runoff_mm(P_mm, CN):
-    """SCS-CN runoff depth (mm)"""
+    """Compute cumulative runoff depth (mm) using SCS-CN method"""
     S = (25400 / CN) - 254
     Ia = 0.2 * S
     if P_mm <= Ia:
@@ -68,6 +63,7 @@ def scs_runoff_mm(P_mm, CN):
     return ((P_mm - Ia) ** 2) / (P_mm - Ia + S)
 
 def hyetograph(total_mm, minutes, shape="Steady", jitter=0.0):
+    """Rain intensity series (mm/minute)"""
     t = np.linspace(0, 1, minutes)
     if shape == "Steady":
         base = np.ones_like(t)
@@ -87,9 +83,10 @@ def hyetograph(total_mm, minutes, shape="Steady", jitter=0.0):
     return series
 
 def mound_capacity(L, W, H, phi):
-    return 0.5 * W * H * L * phi  # triangular cross-section * length * porosity
+    """Triangular cross-section * length * porosity"""
+    return 0.5 * W * H * L * phi
 
-# -------------------- Simulation --------------------
+# -------------------- Simulation Setup --------------------
 minutes = int(duration_min)
 rain_series = hyetograph(total_rain_mm, minutes, rain_shape, randiness)
 
@@ -99,10 +96,10 @@ cum_runoff_no_mound = 0.0
 cum_runoff_with_mound = 0.0
 intercepted = 0.0
 
-# -------------------- Dynamic display ---------------
 placeholder = st.empty()
 progress = st.progress(0)
 
+# -------------------- Simulation Loop --------------------
 for minute in range(minutes):
     dP = rain_series[minute]
     Q_prev = scs_runoff_mm(cumP, CN)
@@ -111,7 +108,8 @@ for minute in range(minutes):
     dQ = max(Q_curr - Q_prev, 0.0)
     dV = (dQ / 1000.0) * A  # m³
     cum_runoff_no_mound += dV
-    # With mound
+
+    # Interception by Hügelkultur mound
     if intercepted < S_t:
         take = min(S_t - intercepted, dV)
         intercepted += take
@@ -127,29 +125,34 @@ for minute in range(minutes):
     left = cx - W / 2
     right = cx + W / 2
     peak = H
+    # Soil mound
     ax.fill([left, cx, right], [0, peak, 0], color="#cd853f", alpha=0.7)
+    # Core sponge
     ax.fill([left + 0.2, cx, right - 0.2], [0, peak * 0.7, 0], color="#8b5a2b", alpha=0.5)
+    # Water fill
     if fill_ratio > 0:
         water_h = peak * 0.7 * fill_ratio
         ax.fill_between([left + 0.2, right - 0.2], 0, water_h, color="dodgerblue", alpha=0.6)
     ax.set_xlim(0, 10)
     ax.set_ylim(0, max(2, H * 1.3))
     ax.axis("off")
-    ax.set_title(f"Minute {minute+1}/{minutes} | Rain {cumP:.1f} mm | "
-                 f"Intercepted {intercepted:.2f} m³ | Runoff (no mound) {cum_runoff_no_mound:.2f} m³")
+    ax.set_title(
+        f"Minute {minute+1}/{minutes} | Rain {cumP:.1f} mm | "
+        f"Intercepted {intercepted:.2f} m³ | Runoff (no mound) {cum_runoff_no_mound:.2f} m³"
+    )
     placeholder.pyplot(fig)
     progress.progress((minute + 1) / minutes)
     time.sleep(1.0 / fps)
 
-st.success("Simulation complete ✅")
+# -------------------- Results --------------------
+st.success("✅ Simulation complete!")
 
-# -------------------- Final metrics -----------------
 col1, col2, col3 = st.columns(3)
-col1.metric("Total Rainfall", f"{cumP:.1f} mm")
-col2.metric("Runoff (No Hügelkultur)", f"{cum_runoff_no_mound:.2f} m³")
-col3.metric("Runoff (With Hügelkultur)", f"{cum_runoff_with_mound:.2f} m³")
+col1.metric("🌧️ Total Rainfall", f"{cumP:.1f} mm")
+col2.metric("💦 Runoff (No Hügelkultur)", f"{cum_runoff_no_mound:.2f} m³")
+col3.metric("💧 Runoff (With Hügelkultur)", f"{cum_runoff_with_mound:.2f} m³")
 
-st.write(f"💧 **Intercepted water volume:** {intercepted:.2f} m³")
-st.write(f"🌱 **Storage capacity of mound:** {S_t:.2f} m³")
-st.write("✅ Hügelkultur **reduced runoff** and **increased local water retention**, supporting soil moisture and erosion control.")
+st.write(f"**Intercepted water volume:** {intercepted:.2f} m³")
+st.write(f"**Storage capacity of mound:** {S_t:.2f} m³")
+st.write("✅ Hügelkultur **reduces runoff** and **increases water retention**, ideal for erosion control and soil moisture improvement.")
 
