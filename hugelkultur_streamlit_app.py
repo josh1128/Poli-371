@@ -1,8 +1,9 @@
-# hugelkultur_map_impact_free.py
+# hugelkultur_map_impact_free_swale.py
 # Hügelkultur impact simulation – HOPE Rwanda (Rwabutenge, Gahanga, Kicukiro)
 # - Rain slider up to 1,400 mm
 # - Wood decomposition reduces effective storage over time
-# - NEW: Visible mound "sinking" over years due to shrinkage/settling (separate height settling rate)
+# - Visible mound "sinking" over years due to shrinkage/settling (separate height settling rate)
+# - NEW (#3): Overflow routing to a swale/pond with its own infiltration and live graphics
 # - Displays note: "Hugelbeds sink in size after several years..." [2]
 
 import math, time
@@ -32,7 +33,8 @@ with st.expander("🗺️ View Project Site Map", expanded=True):
 st.markdown(
     """
     This tool simulates a **rainfall event** and compares **runoff** with and without a Hügelkultur mound.
-    The mound stores rainwater like a sponge, reducing surface runoff and erosion.
+    The mound stores rainwater like a sponge, reducing surface runoff and erosion. Extra water can now overflow
+    into a **downstream swale/pond** that also infiltrates into the subsoil.
     """
 )
 
@@ -104,15 +106,29 @@ annual_height_settling = st.sidebar.slider(
     help="Reduces visible mound height to mimic shrinkage/settling over years."
 )
 
+# -------------------- Catchment & Soil --------------------
 st.sidebar.header("🧮 Catchment & Soil")
 A = st.sidebar.number_input("Contributing area (m²)", 10.0, 10000.0, 300.0, 10.0)
 CN = st.sidebar.slider("Curve Number (CN)", 55, 95, 85, 1)
 
+# -------------------- Downstream Swale/Pond (NEW #3) --------------------
+st.sidebar.header("🟦 Downstream Swale/Pond (Overflow)")
+swale_capacity = st.sidebar.number_input("Swale storage capacity (m³)", 0.0, 5000.0, 8.0, 0.5,
+                                        help="Max volume the swale/pond can hold before spilling.")
+swale_infiltration_m3_per_hr = st.sidebar.slider("Swale infiltration (m³/hr)", 0.0, 20.0, 1.5, 0.5,
+                                                help="How fast water in the swale infiltrates into the soil.")
+
+# Experience toggles
 fps = st.sidebar.slider("Frames per second", 5, 30, 15)
+animate = st.sidebar.toggle("Animate schematic", True)
+run = st.sidebar.button("Run simulation", type="primary")
+if not run:
+    st.stop()
 
 # -------------------- Hydrology Functions --------------------
 def scs_runoff_mm(P_mm, CN):
     """Cumulative runoff depth (mm) via SCS-CN."""
+    CN = float(np.clip(CN, 35, 98))
     S = (25400 / CN) - 254
     Ia = 0.2 * S
     if P_mm <= Ia:
@@ -156,9 +172,9 @@ S_initial = mound_capacity(L, W, H, porosity)
 storage_decay_factor = (1.0 - annual_storage_decay) ** years_since_build
 S_effective = S_initial * storage_decay_factor
 
-# NEW: Visible height settling (geometry only; does NOT change storage, which is already handled)
+# Visible height settling (geometry only; does NOT change storage, which is already handled)
 height_settle_factor = (1.0 - annual_height_settling) ** years_since_build
-H_visible = max(H * height_settle_factor, 0.05)  # keep a tiny floor to avoid zero-height drawing
+H_visible = max(H * height_settle_factor, 0.05)  # tiny floor to avoid zero-height drawing
 core_height_visible = H_visible * 0.7
 
 # Initialize accumulators
@@ -167,12 +183,18 @@ cum_runoff_no_mound = 0.0
 cum_runoff_with_mound = 0.0
 intercepted = 0.0
 
+# Swale states (NEW)
+swale_stored = 0.0
+swale_peak = 0.0
+
 placeholder = st.empty()
 progress = st.progress(0)
 
 # -------------------- Simulation Loop --------------------
 for minute in range(minutes):
     dP = rain_series[minute]
+
+    # --- Catchment runoff generation (no mound) ---
     Q_prev = scs_runoff_mm(cumP, CN)
     cumP += dP
     Q_curr = scs_runoff_mm(cumP, CN)
@@ -180,54 +202,96 @@ for minute in range(minutes):
     dV = (dQ / 1000.0) * A              # incremental runoff volume (m³)
     cum_runoff_no_mound += dV
 
-    # Interception by mound (from runoff only), limited by effective storage
+    # --- Hügel mound interception (limited by effective storage) ---
     if intercepted < S_effective:
         take = min(S_effective - intercepted, dV)
         intercepted += take
         dV -= take
+
+    # --- Overflow routing to swale/pond (NEW #3) ---
+    if dV > 0 and swale_stored < swale_capacity:
+        take2 = min(swale_capacity - swale_stored, dV)
+        swale_stored += take2
+        dV -= take2
+        swale_peak = max(swale_peak, swale_stored)
+
+    # --- Swale infiltration (drain from swale volume each minute) ---
+    if swale_stored > 0:
+        swale_drain = min(swale_stored, (swale_infiltration_m3_per_hr / 60.0))
+        swale_stored -= swale_drain
+
+    # Remaining dV after mound + swale goes offsite as runoff
     cum_runoff_with_mound += dV
 
     fill_ratio = intercepted / S_effective if S_effective > 0 else 0.0
+    swale_ratio = (swale_stored / swale_capacity) if swale_capacity > 0 else 0.0
 
-    # ------------- Draw schematic (with visible sinking) -------------
-    fig, ax = plt.subplots(figsize=(10, 4))
-    ax.plot([0, 10], [0, 0], color="saddlebrown", linewidth=5)  # ground line
+    # ------------- Draw schematic (with visible sinking + swale) -------------
+    fig, ax = plt.subplots(figsize=(11, 4.2))
 
+    # Ground baseline
+    ax.plot([0, 12], [0, 0], color="saddlebrown", linewidth=5)
+
+    # Positions
     cx = 5.0
     left = cx - W / 2.0
     right = cx + W / 2.0
 
     # Soil mound (visible/settled height)
-    ax.fill([left, cx, right], [0, H_visible, 0], color="#cd853f", alpha=0.7, label="Soil")
+    ax.fill([left, cx, right], [0, H_visible, 0], color="#C89E71", alpha=0.8, label="Soil")
 
     # Core (visible/settled height)
-    ax.fill([left + 0.2, cx, right - 0.2], [0, core_height_visible, 0], color="#8b5a2b", alpha=0.5, label="Wood core")
+    ax.fill([left + 0.2, cx, right - 0.2], [0, core_height_visible, 0], color="#8B5A2B", alpha=0.55, label="Wood core")
 
-    # Stored water (limited by effective storage, drawn within visible core)
+    # Stored water in mound (within visible core)
     if fill_ratio > 0:
         water_h = core_height_visible * min(fill_ratio, 1.0)
-        ax.fill_between([left + 0.2, right - 0.2], 0, water_h, color="dodgerblue", alpha=0.6, label="Stored water")
+        ax.fill_between([left + 0.2, right - 0.2], 0, water_h, color="#1E90FF", alpha=0.65, label="Stored in mound")
 
-    # Show dashed line marking "effective capacity" level relative to visible core
+    # Effective capacity line (visual cue)
     if years_since_build > 0 and (annual_storage_decay > 0 or annual_height_settling > 0):
-        # Translate storage decay (void loss) into a notional horizontal line inside the core
-        # purely for visual cue; does not change hydrology beyond S_effective
         eff_ratio = max(storage_decay_factor, 0.0)
         eff_core_h_line = core_height_visible * eff_ratio
         ax.plot([left + 0.2, right - 0.2], [eff_core_h_line, eff_core_h_line], linestyle="--", color="black", linewidth=1)
         ax.text(right - 0.2, eff_core_h_line + 0.03, "effective capacity", ha="right", va="bottom", fontsize=8)
 
-    ax.set_xlim(0, 10)
-    ax.set_ylim(0, max(2, H * 1.3))  # keep y-limits stable relative to as-built H for easy comparison
+    # Swale/Pond graphic block on the right
+    # Draw a rectangular basin; visual height scaled relative to mound height for consistency
+    swale_x0, swale_x1 = 8.0, 10.5
+    swale_h_max = max(0.6, H * 0.9)  # visual height for full capacity
+    # Basin outline
+    ax.fill([swale_x0, swale_x1, swale_x1, swale_x0], [0, 0, swale_h_max, swale_h_max], color="#A9A9A9", alpha=0.15, label="Swale basin")
+    # Water fill based on swale_ratio
+    if swale_capacity > 0 and swale_ratio > 0:
+        swale_h = swale_h_max * min(swale_ratio, 1.0)
+        ax.fill([swale_x0, swale_x1, swale_x1, swale_x0], [0, 0, swale_h, swale_h], color="#4AA3FF", alpha=0.75, label="Swale storage")
+
+    # Overflow arrow from mound to swale (only when overflow occurred this minute)
+    if dV > 0 or (swale_capacity > 0 and swale_ratio > 0):
+        ax.annotate("overflow → swale",
+                    xy=(right, 0.15), xytext=((swale_x0 + swale_x1) / 2.0, swale_h_max + 0.1),
+                    arrowprops=dict(arrowstyle="->", lw=1.5), ha="center", va="bottom", fontsize=9)
+
+    # HUD panel
+    text_box = (
+        f"Rain {cumP:.1f} mm  |  Intercepted {intercepted:.2f} m³  |  "
+        f"Swale {swale_stored:.2f}/{swale_capacity:.2f} m³  |  "
+        f"Runoff (no mound) {cum_runoff_no_mound:.2f} m³"
+    )
+    ax.text(0.4, max(1.6, H * 1.05), text_box, fontsize=10, bbox=dict(boxstyle="round,pad=0.35", fc="#F7F2E7", ec="#8B7E66", alpha=0.95))
+
+    ax.set_xlim(0, 12)
+    ax.set_ylim(0, max(2, H * 1.4))
     ax.axis("off")
     ax.set_title(
-        f"Minute {minute+1}/{minutes} | Rain {cumP:.1f} mm | "
-        f"Intercepted {intercepted:.2f} m³ | Runoff (no mound) {cum_runoff_no_mound:.2f} m³"
+        f"Minute {minute+1}/{minutes}  •  With Hügelkultur + Swale Routing",
+        fontsize=12, loc="left"
     )
 
-    placeholder.pyplot(fig)
+    if animate:
+        placeholder.pyplot(fig)
+        time.sleep(1.0 / fps)
     progress.progress((minute + 1) / minutes)
-    time.sleep(1.0 / fps)
 
 # -------------------- Results --------------------
 st.success("✅ Simulation complete!")
@@ -235,7 +299,7 @@ st.success("✅ Simulation complete!")
 col1, col2, col3 = st.columns(3)
 col1.metric("🌧️ Total Rainfall", f"{cumP:.1f} mm")
 col2.metric("💦 Runoff (No Hügelkultur)", f"{cum_runoff_no_mound:.2f} m³")
-col3.metric("💧 Runoff (With Hügelkultur)", f"{cum_runoff_with_mound:.2f} m³")
+col3.metric("💧 Runoff (With Hügelkultur + Swale)", f"{cum_runoff_with_mound:.2f} m³")
 
 st.write(f"**Intercepted water volume (this storm):** {intercepted:.2f} m³")
 
@@ -248,6 +312,13 @@ cap2.metric("Effective capacity today (m³)", f"{S_effective:.2f}")
 remain_pct = 100.0 * (S_effective / S_initial_val) if S_initial_val > 0 else 0.0
 cap3.metric("Capacity remaining", f"{remain_pct:.0f}%")
 cap4.metric("Visible height today (m)", f"{H_visible:.2f}")
+
+# Swale summary
+st.markdown("### 🟦 Swale / Pond Summary")
+s1, s2, s3 = st.columns(3)
+s1.metric("Swale capacity (m³)", f"{swale_capacity:.2f}")
+s2.metric("Swale peak storage (m³)", f"{swale_peak:.2f}")
+s3.metric("Swale storage at end (m³)", f"{swale_stored:.2f}")
 
 st.caption(
     "Hugelbeds sink in size after several years due to wood shrinkage, decomposition and settling [2]. "
