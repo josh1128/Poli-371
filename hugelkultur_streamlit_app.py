@@ -1,344 +1,350 @@
-# permeable_pavement_live.py
-# Live, time-stepped simulation for permeable pavements with Play / Pause / Step
-# - 1-minute timestep water balance
-# - Live KPIs, hyetograph, storage gauge, and animated cross-section fill
-# - Pavement types: Porous asphalt, Pervious concrete, PICP
+# rain_env_live.py
+# A live, interactive "environment" that simulates rainfall, flow, infiltration & storage
+# across a small hilly site with multiple pavement types you can paint onto the map.
+#
+# - 2D heightmap terrain (hills like Kigali's topography, synthetic but realistic)
+# - Per-cell pavement type: Impervious, Porous Asphalt, Pervious Concrete, PICP, Soil
+# - Each permeable pavement has surface k (mm/hr) + reservoir storage (m) + soil Ksat (mm/hr)
+# - Minute-by-minute rain (constant/triangular), Play/Pause/Step
+# - Overland flow: slope-driven diffusion with downhill bias
+# - Live maps: water depth, flow velocity magnitude, pavement layout, storage fill
+# - Paint tools to "draw" real pavements into the environment
 
 import time
 import numpy as np
 import matplotlib.pyplot as plt
 import streamlit as st
 
-st.set_page_config(page_title="Permeable Pavements – LIVE", layout="wide")
-st.title("🧱 Permeable Pavements – Live Simulation")
+# ---------------------------- UI Setup ----------------------------
+st.set_page_config(page_title="Live Rain & Pavements Environment", layout="wide")
+st.title("🌧️ Live Rain & Permeable Pavements – Mini Environment")
 
-# -------------------- Presets --------------------
-PRESETS = {
-    "Porous asphalt":      {"k_mm_hr": 3000.0, "t_cm": 5.0,  "note": "Avoid over-compaction; preserve surface voids."},
-    "Pervious concrete":   {"k_mm_hr": 2000.0, "t_cm": 12.0, "note": "Place/finish quickly; do not over-trowel."},
-    "PICP (interlocking)": {"k_mm_hr": 1200.0, "t_cm": 8.0,  "note": "Keep joints/joint stone clean; vacuum as needed."},
-}
-
-# -------------------- Helpers --------------------
+# ---------------------------- Helpers -----------------------------
 def mm_to_m(x): return x / 1000.0
-def cm_to_m(x): return x / 100.0
 def L_to_m3(x): return x / 1000.0
+def clamp(x, lo, hi): return max(lo, min(hi, x))
 
 def make_hyetograph(total_mm, duration_hr, kind="Constant", peak_at=0.5):
-    """Return per-minute intensity array in mm/min that sums to total_mm over duration_hr."""
-    n = int(duration_hr * 60)
-    if n < 1:
-        return np.array([total_mm])  # degenerate
+    n = max(1, int(duration_hr * 60))
     if kind == "Constant" or n == 1:
         return np.full(n, total_mm / n)
-    # Triangular with peak fraction at peak_at
     t = np.linspace(0, 1, n)
-    up = t <= peak_at
-    down = t > peak_at
     y = np.zeros_like(t)
-    if peak_at > 0:
-        y[up] = t[up] / peak_at
-    if peak_at < 1:
-        y[down] = (1 - t[down]) / (1 - peak_at)
+    up = t <= peak_at
+    dn = t > peak_at
+    if peak_at > 0: y[up] = t[up] / peak_at
+    if peak_at < 1: y[dn] = (1 - t[dn]) / (1 - peak_at)
     y = np.clip(y, 0, None)
-    if y.sum() == 0:
-        return np.full(n, total_mm / n)
-    y = y / y.sum() * total_mm
+    y = y / y.sum() * total_mm if y.sum() > 0 else np.full(n, total_mm/n)
     return y
 
-# -------------------- Sidebar (controls) --------------------
-st.sidebar.header("Storm & Site")
-P_mm   = st.sidebar.slider("Storm depth (mm)", 5, 1400, 80, 5)
-T_hr   = st.sidebar.slider("Storm duration (hr)", 0.5, 48.0, 6.0, 0.5)
-A_m2   = st.sidebar.number_input("Contributing area (m²)", 10.0, 100000.0, 400.0, 10.0)
+# ---------------------------- Sidebar -----------------------------
+st.sidebar.header("Environment")
+nx = st.sidebar.slider("Grid size (nx=ny)", 40, 120, 80, 10)
+cell_m = st.sidebar.slider("Cell size (m)", 1, 5, 2, 1)  # each cell width/height in meters
+area_m2 = (nx * cell_m) * (nx * cell_m)
 
-st.sidebar.header("Hyetograph")
-pattern = st.sidebar.selectbox("Rain pattern", ["Constant", "Triangular"])
-peak_pos = st.sidebar.slider("Triangular peak position (0–1)", 0.05, 0.95, 0.5, 0.05) if pattern == "Triangular" else 0.5
+st.sidebar.header("Storm")
+P_mm = st.sidebar.slider("Storm depth (mm)", 5, 1400, 80, 5)
+T_hr = st.sidebar.slider("Duration (hr)", 0.5, 24.0, 3.0, 0.5)
+pattern = st.sidebar.selectbox("Pattern", ["Constant", "Triangular"])
+peak_pos = st.sidebar.slider("Triangular peak position", 0.05, 0.95, 0.4, 0.05) if pattern == "Triangular" else 0.5
 
-st.sidebar.header("Pavement Type & Surface")
-ptype  = st.sidebar.selectbox("Pavement type", list(PRESETS.keys()))
-preset = PRESETS[ptype]
-k_clean = st.sidebar.number_input("Clean surface permeability (mm/hr)", 100.0, 10000.0, float(preset["k_mm_hr"]), 100.0)
-clog_pct = st.sidebar.slider("Clogging level (0% clean → 80% clogged)", 0, 80, 10, 5)
-surface_t_cm = st.sidebar.number_input("Surface thickness (cm)", 3.0, 50.0, float(preset["t_cm"]), 1.0)
+st.sidebar.header("Soils")
+soil_ksat_mm_hr = st.sidebar.slider("Soil Ksat (mm/hr)", 0.5, 150.0, 10.0, 0.5)
 
-st.sidebar.header("Reservoir Layers")
-choker_t_cm = st.sidebar.slider("Choker/bedding thickness (cm)", 2, 5, 3)
-base_t_cm   = st.sidebar.slider("Base reservoir thickness (cm)", 5, 25, 10)
-sub_t_cm    = st.sidebar.slider("Subbase reservoir thickness (cm)", 10, 60, 25)
-base_void   = st.sidebar.slider("Base void ratio (0–0.5)", 0.10, 0.50, 0.30, 0.01)
-sub_void    = st.sidebar.slider("Subbase void ratio (0–0.5)", 0.10, 0.50, 0.35, 0.01)
+st.sidebar.header("Flow Physics")
+mann_n = st.sidebar.slider("Overland roughness (Manning n)", 0.01, 0.20, 0.05, 0.01)
+dt_scale = st.sidebar.slider("Flow time-step scale (stability)", 0.1, 2.0, 1.0, 0.1)
 
-st.sidebar.header("Soils & Underdrain")
-soil_ksat = st.sidebar.number_input("Soil Ksat (mm/hr)", 0.5, 200.0, 10.0, 0.5)
-use_drain = st.sidebar.checkbox("Include underdrain", value=False)
-drain_Lps = st.sidebar.number_input("Underdrain capacity (L/s)", 0.0, 100.0, 2.0, 0.5) if use_drain else 0.0
+st.sidebar.header("Playback")
+speed = st.sidebar.selectbox("Playback speed", ["Fast", "Normal", "Slow"])
+delay = {"Fast": 0.01, "Normal": 0.05, "Slow": 0.12}[speed]
 
-st.sidebar.header("Losses & Safety")
-edge_losses_pct = st.sidebar.slider("Edge/maintenance losses (%)", 0, 20, 5, 1)
-storage_sf = st.sidebar.slider("Storage safety factor (0.8–1.2)", 0.8, 1.2, 1.0, 0.05)
+# ------------------------- Pavement Catalog -----------------------
+# Parameters per pavement type:
+# - surf_k_mm_hr: surface permeability (limits per-minute pass-through)
+# - res_storage_m: thickness of reservoir * void (effective storage depth, meters of water per cell area)
+# - label/color
+PAVES = {
+    0: {"name":"Soil",            "surf_k_mm_hr": soil_ksat_mm_hr, "res_storage_m": 0.00, "color": (0.85, 1.00, 0.85)},
+    1: {"name":"Impervious",      "surf_k_mm_hr": 0.0,             "res_storage_m": 0.00, "color": (0.80, 0.80, 0.80)},
+    2: {"name":"Porous Asphalt",  "surf_k_mm_hr": 3000.0,          "res_storage_m": 0.10, "color": (0.50, 0.50, 0.60)},
+    3: {"name":"Pervious Conc.",  "surf_k_mm_hr": 2000.0,          "res_storage_m": 0.12, "color": (0.70, 0.70, 0.80)},
+    4: {"name":"PICP",            "surf_k_mm_hr": 1200.0,          "res_storage_m": 0.15, "color": (0.60, 0.65, 0.75)},
+}
+# Note: res_storage_m is an "effective water depth" that can be held in the base/subbase (area-normalized).
 
-st.sidebar.header("Live Controls")
-sim_speed = st.sidebar.selectbox("Playback speed", ["Fast", "Normal", "Slow"])
-delay = {"Fast": 0.02, "Normal": 0.08, "Slow": 0.15}[sim_speed]
+st.sidebar.header("Paint Pavements")
+paint_type = st.sidebar.selectbox("Brush type", [f"{k}: {v['name']}" for k,v in PAVES.items()], index=3)
+brush = st.sidebar.slider("Brush radius (cells)", 1, 8, 4, 1)
 
-# -------------------- Session State --------------------
-if "t_idx" not in st.session_state: st.session_state.t_idx = 0
-if "running" not in st.session_state: st.session_state.running = False
+st.sidebar.header("Clogging")
+clog_pct = st.sidebar.slider("Surface clogging (0–80%)", 0, 80, 10, 5)
 
-cols = st.columns([1,1,1,1])
-play   = cols[0].button("▶️ Play", use_container_width=True)
-pause  = cols[1].button("⏸️ Pause", use_container_width=True)
-step   = cols[2].button("⏭️ Step", use_container_width=True)
-reset  = cols[3].button("🔄 Reset", use_container_width=True)
+# ---------------------- Session State ----------------------------
+if "terrain" not in st.session_state or st.session_state.get("nx") != nx:
+    # Synthetic hills: sum of sinusoids + Gaussian bump → "Rwanda-like" rolling site
+    x = np.linspace(0, 2*np.pi, nx)
+    y = np.linspace(0, 2*np.pi, nx)
+    X, Y = np.meshgrid(x, y, indexing="ij")
+    Z = 0.8*np.sin(1.0*X) + 0.6*np.sin(1.3*Y + 0.7) + 0.4*np.sin(0.7*X + 1.1*Y)
+    # add a hill
+    cx, cy = int(nx*0.65), int(nx*0.35)
+    r2 = (np.arange(nx)[:,None]-cx)**2 + (np.arange(nx)[None,:]-cy)**2
+    Z += 1.5*np.exp(-r2/(2*(0.15*nx)**2))
+    Z = (Z - Z.min())/(Z.max()-Z.min())  # normalize 0..1
+    st.session_state.terrain = Z
+    st.session_state.nx = nx
 
-if play:  st.session_state.running = True
-if pause: st.session_state.running = False
-if reset:
+    # Pavement layout (ints 0..4). Start with "impervious road" across center + soil elsewhere.
+    pave = np.zeros((nx, nx), dtype=np.int32)  # soil
+    pave[nx//2-2:nx//2+2, :] = 1  # a 4-cell-wide road
+    # seed a pervious shoulder
+    pave[nx//2+2:nx//2+4, int(nx*0.15):int(nx*0.85)] = 2
+    st.session_state.pave = pave
+
+    # State arrays
+    st.session_state.h = np.zeros((nx, nx), dtype=np.float64)  # water depth on surface (m)
+    st.session_state.s = np.zeros((nx, nx), dtype=np.float64)  # stored in reservoir (m water equiv.)
+    st.session_state.t_idx = 0
+    st.session_state.running = False
+
+# hyetograph
+rain_mm_min = make_hyetograph(P_mm, T_hr, pattern, peak_pos)
+n_min = len(rain_mm_min)
+nx = st.session_state.nx
+Z  = st.session_state.terrain
+pave = st.session_state.pave
+h = st.session_state.h       # surface water depth (m)
+s_store = st.session_state.s # reservoir storage (m water)
+
+# Effective surface permeability after clogging
+def k_eff_for(cell_code):
+    k = PAVES[int(cell_code)]["surf_k_mm_hr"]
+    return k * (1.0 - clog_pct/100.0)
+
+k_eff_map_mm_hr = np.vectorize(k_eff_for)(pave)
+k_eff_map_m_min = mm_to_m(k_eff_map_mm_hr)/60.0
+soil_ksat_m_min = mm_to_m(soil_ksat_mm_hr)/60.0
+
+# Reservoir capacity (m water) per cell
+res_cap_m = np.zeros_like(s_store)
+for code, props in PAVES.items():
+    res_cap_m[pave==code] = props["res_storage_m"]
+
+# ---------------------- Paint Tool ------------------------------
+st.caption("Tip: Use the brush to paint pavements, then press ▶️ Play.")
+
+with st.form("paint"):
+    st.write("Click anywhere on the map preview to record a center coordinate, then apply brush.")
+    click_x = st.number_input("Center X (0..nx-1)", min_value=0, max_value=nx-1, value=nx//2, step=1)
+    click_y = st.number_input("Center Y (0..nx-1)", min_value=0, max_value=nx-1, value=nx//2, step=1)
+    apply = st.form_submit_button("Apply Brush")
+if apply:
+    code = int(paint_type.split(":")[0])
+    rr = brush
+    x0, y0 = int(click_x), int(click_y)
+    xs = slice(clamp(x0-rr, 0, nx-1), clamp(x0+rr+1, 0, nx))
+    ys = slice(clamp(y0-rr, 0, nx-1), clamp(y0+rr+1, 0, nx))
+    patch = np.indices((xs.stop-xs.start, ys.stop-ys.start))
+    mask = (patch[0]-(x0-xs.start))**2 + (patch[1]-(y0-ys.start))**2 <= rr**2
+    pave_view = st.session_state.pave[xs, ys]
+    pave_view[mask] = code
+    st.session_state.pave[xs, ys] = pave_view
+    # refresh derived fields
+    pave = st.session_state.pave
+    k_eff_map_mm_hr = np.vectorize(k_eff_for)(pave)
+    k_eff_map_m_min = mm_to_m(k_eff_map_mm_hr)/60.0
+    for c, props in PAVES.items():
+        res_cap_m[pave==c] = props["res_storage_m"]
+
+# ---------------------- Controls -------------------------------
+c1, c2, c3, c4 = st.columns(4)
+if c1.button("▶️ Play", use_container_width=True): st.session_state.running = True
+if c2.button("⏸️ Pause", use_container_width=True): st.session_state.running = False
+if c3.button("⏭️ Step", use_container_width=True):
+    st.session_state.t_idx = min(st.session_state.t_idx + 1, n_min-1)
+    st.session_state.running = False
+if c4.button("🔄 Reset", use_container_width=True):
     st.session_state.running = False
     st.session_state.t_idx = 0
-if step:
-    st.session_state.t_idx += 1
-    st.session_state.running = False
+    st.session_state.h.fill(0.0)
+    st.session_state.s.fill(0.0)
 
-# -------------------- Precompute series --------------------
-n_min = max(1, int(T_hr * 60))
-rain_mm_min = make_hyetograph(P_mm, T_hr, pattern, peak_pos)  # length n_min
-k_eff_mm_hr = k_clean * (1.0 - clog_pct / 100.0)
-k_eff_mm_min = k_eff_mm_hr / 60.0
-soil_ksat_mm_min = soil_ksat / 60.0
-drain_m3_min = L_to_m3(drain_Lps * 60.0) if (use_drain and drain_Lps > 0) else 0.0
+# ---------------------- Physics -------------------------------
+# Precompute terrain slopes (central differences)
+dx = cell_m
+dy = cell_m
+dZdx = np.zeros_like(Z)
+dZdy = np.zeros_like(Z)
+dZdx[1:-1,:] = (Z[2:,:] - Z[:-2,:])/(2*dx)
+dZdy[:,1:-1] = (Z[:,2:] - Z[:,:-2])/(2*dy)
 
-# Volumes (capacities)
-storage_m3 = storage_sf * (
-    A_m2 * cm_to_m(base_t_cm) * base_void +
-    A_m2 * cm_to_m(sub_t_cm)  * sub_void
-)
+def step_once(t):
+    """Advance one minute: rain → surface pass → storage/soil → overland flow."""
+    global h, s_store
 
-# Containers for time series
-rain_in_m3   = np.zeros(n_min)
-surf_pass_m3 = np.zeros(n_min)
-surf_rej_m3  = np.zeros(n_min)
-soil_exf_m3  = np.zeros(n_min)
-drain_out_m3 = np.zeros(n_min)
-overflow_m3  = np.zeros(n_min)
-stored_m3    = np.zeros(n_min)  # instantaneous storage each minute
+    # 1) Rainfall arrives (mm/min -> m)
+    rain_m = mm_to_m(rain_mm_min[t])
 
-# Sim state variables
-S = 0.0  # current stored volume (m3)
-loss_factor = (1.0 - edge_losses_pct/100.0)
+    # 2) Surface pass capacity (m/min) by pavement
+    surf_cap_m = k_eff_map_m_min
 
-# -------------------- Live Areas --------------------
-top_l, top_c, top_r = st.columns([1.2,1.4,1.2])
+    # water that can pass into system this minute (per cell area)
+    pass_m = np.minimum(rain_m, surf_cap_m)  # into reservoir/soil
+    reject_m = np.maximum(0.0, rain_m - pass_m)  # immediate surface addition
 
-hyetograph_area = top_l.empty()
-kpi_area = top_c.empty()
-gauge_area = top_r.empty()
+    # add rejected rain to surface water
+    h = h + reject_m
 
-cross_col, bars_col = st.columns([1.1, 0.9])
-cross_area = cross_col.empty()
-bars_area = bars_col.empty()
+    # 3) Handle pass_m: first soil exfiltration (soil Ksat), then reservoir storage
+    soil_take = np.minimum(pass_m, soil_ksat_m_min)
+    remain = pass_m - soil_take
 
-tips = st.expander("Construction & O&M tips (quick)")
-with tips:
-    st.markdown(
-        f"- Keep fines/mud out during construction; protect layers to prevent clogging.\n"
-        f"- **{ptype}**: {preset['note']}\n"
-        f"- Avoid over-compacting subgrade; enable infiltration to native soil.\n"
-        f"- Routine sweeping/vacuuming (esp. PICP joints) maintains surface permeability.\n"
-        f"- On steeper sites, terrace subgrades and consider underdrains."
+    # storage space left
+    space = np.maximum(0.0, res_cap_m - s_store)
+    to_store = np.minimum(remain, space)
+    overflow_from_store = np.maximum(0.0, remain - space)  # becomes surface water
+    s_store = s_store + to_store
+    h = h + overflow_from_store
+
+    # 4) Overland flow (very simple shallow-water like diffusion with slope bias)
+    # Compute water surface elevation = terrain + water depth
+    eta = Z + h
+    # Gradients of eta drive flow
+    deta_dx = np.zeros_like(eta)
+    deta_dy = np.zeros_like(eta)
+    deta_dx[1:-1,:] = (eta[2:,:] - eta[:-2,:])/(2*dx)
+    deta_dy[:,1:-1] = (eta[:,2:] - eta[:,:-2])/(2*dy)
+
+    # Velocity magnitude proxy using Manning (very simplified)
+    # v ~ (h^(2/3)/n) * sqrt(slope) ; use |grad(eta)| as slope proxy
+    slope_mag = np.sqrt(deta_dx**2 + deta_dy**2) + 1e-9
+    v = (np.power(np.maximum(h,0.0), 2.0/3.0) / mann_n) * np.sqrt(slope_mag)
+
+    # Fluxes (discretized, stability via dt_scale)
+    # Move fraction of water down gradient
+    dt = dt_scale * 60.0  # seconds per step (scaled; display is still per-minute rain)
+    # Simple upwind: compute fractional outflow per neighbor directions
+    # Normalize gradient components to unit vector
+    ux = -deta_dx / (slope_mag)
+    uy = -deta_dy / (slope_mag)
+
+    # Outflow per cell (m depth) ~ coef * v; keep small for stability
+    coef = 0.15 * dt / max(dx, dy)
+    out = coef * v
+    out = np.minimum(out, h)  # cannot send more than available
+
+    # Distribute outflow to 4-neighborhood based on direction cosines
+    # weights to (i+1,j) (east), (i-1,j) (west), (i,j+1) (north), (i,j-1) (south)
+    wx_e = np.maximum(0.0, ux); wx_w = np.maximum(0.0, -ux)
+    wy_n = np.maximum(0.0, uy); wy_s = np.maximum(0.0, -uy)
+    wsum = wx_e + wx_w + wy_n + wy_s + 1e-12
+    fx_e = out * (wx_e/wsum); fx_w = out * (wx_w/wsum)
+    fy_n = out * (wy_n/wsum); fy_s = out * (wy_s/wsum)
+
+    # Apply fluxes
+    h_next = h.copy()
+    # east/west
+    h_next[:, :-1] -= fx_e[:, :-1]; h_next[:, 1:] += fx_e[:, :-1]
+    h_next[:, 1:]  -= fx_w[:, 1:];  h_next[:, :-1]+= fx_w[:, 1:]
+    # north/south
+    h_next[:-1, :] -= fy_n[:-1, :]; h_next[1:, :]  += fy_n[:-1, :]
+    h_next[1:,  :] -= fy_s[1:,  :]; h_next[:-1, :]+= fy_s[1:,  :]
+
+    # Small evaporation/drainage from surface where permeable (optional realism)
+    evap = 0.0
+    h = np.maximum(0.0, h_next - evap)
+
+# ---------------------- Live Displays ---------------------------
+top_l, top_c, top_r = st.columns([1.1,1.1,0.8])
+map_area = top_l.empty()
+flow_area = top_c.empty()
+legend_area = top_r.empty()
+
+bot_l, bot_c, bot_r = st.columns([1.0,1.0,1.0])
+pave_area = bot_l.empty()
+storage_area = bot_c.empty()
+kpi_area = bot_r.empty()
+
+def render_maps(t_now):
+    # Surface water depth
+    fig, ax = plt.subplots(figsize=(5.2, 5.2))
+    im = ax.imshow(h, origin="lower", cmap="Blues")
+    ax.set_title(f"Surface Water Depth (m) — minute {t_now+1}/{n_min}")
+    plt.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+    map_area.pyplot(fig)
+
+    # Flow velocity proxy
+    eta = Z + h
+    deta_dx = np.zeros_like(eta); deta_dy = np.zeros_like(eta)
+    deta_dx[1:-1,:] = (eta[2:,:] - eta[:-2,:])/(2*dx)
+    deta_dy[:,1:-1] = (eta[:,2:] - eta[:,:-2])/(2*dy)
+    slope_mag = np.sqrt(deta_dx**2 + deta_dy**2) + 1e-9
+    v = (np.power(np.maximum(h,0.0), 2.0/3.0) / mann_n) * np.sqrt(slope_mag)
+
+    fig2, ax2 = plt.subplots(figsize=(5.2, 5.2))
+    im2 = ax2.imshow(v, origin="lower", cmap="magma")
+    ax2.set_title("Flow Speed (relative units)")
+    plt.colorbar(im2, ax=ax2, fraction=0.046, pad=0.04)
+    flow_area.pyplot(fig2)
+
+    # Legend – pavement colors
+    figl, axl = plt.subplots(figsize=(4.4, 3.2))
+    axl.axis("off")
+    y0 = 0.9
+    for k, props in PAVES.items():
+        axl.add_patch(plt.Rectangle((0.05, y0-0.06), 0.1, 0.05, color=props["color"]))
+        axl.text(0.17, y0-0.04, f"{k}: {props['name']} (k={props['surf_k_mm_hr']:.0f} mm/hr, store={props['res_storage_m']:.2f} m)", fontsize=9)
+        y0 -= 0.14
+    axl.set_title("Pavement Legend")
+    legend_area.pyplot(figl)
+
+def render_layouts():
+    # Pavement layout
+    rgb = np.zeros((nx, nx, 3), dtype=float)
+    for k, props in PAVES.items():
+        rgb[pave==k] = props["color"]
+    fig, ax = plt.subplots(figsize=(5.2, 5.2))
+    ax.imshow(rgb, origin="lower")
+    ax.set_title("Pavement Layout (paintable)")
+    pave_area.pyplot(fig)
+
+    # Storage fill fraction
+    frac = np.where(res_cap_m>0, np.clip(s_store/res_cap_m, 0, 1), 0.0)
+    fig2, ax2 = plt.subplots(figsize=(5.2, 5.2))
+    im = ax2.imshow(frac, origin="lower", vmin=0, vmax=1, cmap="viridis")
+    ax2.set_title("Reservoir Fill (fraction of capacity)")
+    plt.colorbar(im, ax=ax2, fraction=0.046, pad=0.04)
+    storage_area.pyplot(fig2)
+
+def render_kpis(t_now):
+    rain_total_m3 = mm_to_m(rain_mm_min[:t_now+1].sum()) * area_m2
+    surface_vol_m3 = h.sum() * (cell_m**2)
+    stored_m3 = s_store.sum() * (cell_m**2)
+
+    # Very rough “leaving the system” via soil exfil estimate (we handled implicitly cell-by-cell)
+    # We’ll report stored & on-surface as of now.
+    kpi_area.metric("Cumulative rain (m³)", f"{rain_total_m3:,.1f}")
+    kpi_area.write(
+        f"- Surface water now: **{surface_vol_m3:,.1f} m³**  \n"
+        f"- Stored in reservoirs now: **{stored_m3:,.1f} m³**  \n"
+        f"- Effective surface k reduced by clogging: **{(1-clog_pct/100):.0%}** of clean"
     )
 
-# -------------------- Render functions --------------------
-def render_hyetograph(t_now):
-    fig, ax = plt.subplots(figsize=(4.8, 2.2))
-    ax.bar(np.arange(n_min), rain_mm_min, width=1.0)
-    ax.axvline(t_now, linestyle="--")
-    ax.set_title("Hyetograph (mm/min)")
-    ax.set_xlabel("Minute")
-    ax.set_ylabel("mm")
-    hyetograph_area.pyplot(fig)
-
-def render_kpis(t_now, totals):
-    rain_eff = totals["rain_eff"]
-    runoff   = totals["runoff"]
-    stored   = totals["stored"]
-    soilx    = totals["soilx"]
-    drain    = totals["drain"]
-    c1, c2, c3 = kpi_area.columns(3)
-    c1.metric("Rain volume (eff.)", f"{rain_eff:.1f} m³")
-    c2.metric("Runoff / Overflow", f"{runoff:.1f} m³")
-    c3.metric("Stored (current)", f"{stored:.1f} m³")
-    c4, c5, c6 = kpi_area.columns(3)
-    c4.metric("Exfiltrated to soil", f"{soilx:.1f} m³")
-    c5.metric("Underdrain outflow", f"{drain:.1f} m³")
-    c6.metric("Surface k (eff.)", f"{k_eff_mm_hr:.0f} mm/hr")
-
-def render_gauge(S_now):
-    fig, ax = plt.subplots(figsize=(4.4, 2.2))
-    cap = max(1e-6, storage_m3)
-    frac = min(1.0, S_now / cap)
-    ax.barh([0], [cap], height=0.5, edgecolor="black", fill=False)
-    ax.barh([0], [S_now], height=0.5)
-    ax.set_xlim(0, cap)
-    ax.set_yticks([])
-    ax.set_xlabel("Storage (m³)")
-    ax.set_title(f"Reservoir fill: {S_now:.1f}/{cap:.1f} m³ ({frac*100:.0f}%)")
-    gauge_area.pyplot(fig)
-
-def render_cross_section(S_now):
-    fig, ax = plt.subplots(figsize=(6.2, 5.0))
-    ax.set_xlim(0,1); ax.set_ylim(0,1); ax.axis("off")
-
-    surf_h = surface_t_cm
-    chok_h = choker_t_cm
-    base_h = base_t_cm
-    sub_h  = sub_t_cm
-    total  = surf_h + chok_h + base_h + sub_h
-    nh = lambda x: x / total
-
-    y = 0.0
-    layers = [
-        ("Subbase reservoir", sub_h, (0.85, 0.92, 1.00), f"Void≈{sub_void:.2f}", "sub"),
-        ("Base reservoir",    base_h, (0.80, 0.87, 0.98), f"Void≈{base_void:.2f}", "base"),
-        ("Choker/Bedding",    chok_h, (0.92, 0.92, 0.92), "Uniform stone",        "none"),
-        (ptype,               surf_h, (0.75, 0.75, 0.75), f"k≈{k_eff_mm_hr:.0f} mm/hr", "none"),
-    ]
-
-    # Draw layers
-    for name, h_cm, color, note, key in layers:
-        h = nh(h_cm)
-        ax.add_patch(plt.Rectangle((0.1, y), 0.8, h, facecolor=color, edgecolor="black"))
-        ax.text(0.5, y + h/2, f"{name}\n{h_cm:.0f} cm\n{note}", ha="center", va="center", fontsize=9)
-        y += h
-
-    # Draw water fill within reservoirs (stack base then subbase)
-    cap_base = A_m2 * cm_to_m(base_t_cm) * base_void
-    cap_sub  = A_m2 * cm_to_m(sub_t_cm)  * sub_void
-    # Scale by safety factor (filled volume respects real cap, but gauge shows sf-adjusted)
-    cap_base *= storage_sf
-    cap_sub  *= storage_sf
-
-    remaining = S_now
-    # Fill base first
-    if cap_base > 0:
-        fill_base = min(remaining, cap_base); remaining -= fill_base
-    else:
-        fill_base = 0
-    if cap_sub > 0:
-        fill_sub  = min(remaining, cap_sub);  remaining -= fill_sub
-    else:
-        fill_sub = 0
-
-    # Convert to normalized heights proportional to layer height
-    # (visual only; not exact porosity mapping)
-    y0_sub = 0.0
-    h_sub = nh(sub_t_cm)
-    y0_base = y0_sub + h_sub
-    h_base  = nh(base_t_cm)
-
-    def draw_fill(y0, h, frac):
-        if frac <= 0: return
-        ax.add_patch(plt.Rectangle((0.1, y0), 0.8, h*frac, facecolor=(0.5,0.7,1.0,0.6), edgecolor=None))
-
-    frac_base = 0.0 if cap_base == 0 else (fill_base / cap_base)
-    frac_sub  = 0.0 if cap_sub  == 0 else (fill_sub  / cap_sub)
-    draw_fill(y0_sub,  h_sub,  frac_sub)
-    draw_fill(y0_base, h_base, frac_base)
-
-    if use_drain and drain_Lps > 0:
-        ax.plot([0.15, 0.85], [0.05, 0.05], lw=6)
-        ax.text(0.5, 0.02, f"Underdrain (~{drain_Lps:.1f} L/s)", ha="center", va="bottom", fontsize=9)
-
-    ax.text(0.5, -0.02, f"Soil (Ksat≈{soil_ksat:.1f} mm/hr)", ha="center", va="top", fontsize=10)
-
-    cross_area.pyplot(fig)
-
-def render_bars(t_now):
-    labels = ["Runoff", "Stored (curr.)", "Soil Exfiltration", "Underdrain"]
-    v_runoff = overflow_m3[:t_now+1].sum() + surf_rej_m3[:t_now+1].sum()
-    v_store  = stored_m3[t_now]
-    v_soil   = soil_exf_m3[:t_now+1].sum()
-    v_drain  = drain_out_m3[:t_now+1].sum()
-
-    fig, ax = plt.subplots(figsize=(6.6, 3.4))
-    vals = [v_runoff, v_store, v_soil, v_drain]
-    ax.bar(labels, vals)
-    ax.set_ylabel("Volume (m³)")
-    ax.set_title("Where has the stormwater gone so far?")
-    vmax = max(vals) if max(vals) > 0 else 1.0
-    for i, v in enumerate(vals):
-        ax.text(i, v + 0.02*vmax, f"{v:.1f}", ha="center", va="bottom", fontsize=9)
-    bars_area.pyplot(fig)
-
-# -------------------- Simulation Runner --------------------
-def simulate_until(t_stop_idx):
-    global S
-    for t in range(st.session_state.t_idx, min(t_stop_idx+1, n_min)):
-        # Minute rainfall (effective after minor edge losses)
-        r_mm = rain_mm_min[t]
-        rain_in_m3[t] = mm_to_m(r_mm) * A_m2 * loss_factor
-
-        # Surface pass limited by k_eff
-        surf_cap_m3_min = mm_to_m(k_eff_mm_min) * A_m2
-        pass_m3 = min(rain_in_m3[t], surf_cap_m3_min)
-        rej_m3  = max(0.0, rain_in_m3[t] - pass_m3)
-
-        # At reservoir this minute:
-        soil_m3 = mm_to_m(soil_ksat_mm_min) * A_m2
-        drain_m3_now = drain_m3_min
-        available_storage = max(0.0, storage_m3 - S)
-
-        # Water that needs handling now:
-        need = pass_m3
-
-        # First: soil exfil + drain (limited by available water)
-        to_soil  = min(need, soil_m3); need -= to_soil
-        to_drain = min(need, drain_m3_now); need -= to_drain
-
-        # Then: storage
-        to_store = min(need, available_storage); need -= to_store
-
-        # Anything left is overflow
-        to_over = max(0.0, need)
-
-        # Update state and series
-        S = max(0.0, min(storage_m3, S + to_store))
-        surf_pass_m3[t] = pass_m3
-        surf_rej_m3[t]  = rej_m3
-        soil_exf_m3[t]  = to_soil
-        drain_out_m3[t] = to_drain
-        overflow_m3[t]  = to_over
-        stored_m3[t]    = S
-
-        st.session_state.t_idx = t
-
-# -------------------- Main Live Loop --------------------
-def totals_up_to(t_now):
-    return {
-        "rain_eff": rain_in_m3[:t_now+1].sum(),
-        "runoff":   overflow_m3[:t_now+1].sum() + surf_rej_m3[:t_now+1].sum(),
-        "stored":   stored_m3[t_now],
-        "soilx":    soil_exf_m3[:t_now+1].sum(),
-        "drain":    drain_out_m3[:t_now+1].sum(),
-    }
-
-# Always render initial plots for current index
+# Initial render
 t_now = min(st.session_state.t_idx, n_min-1)
-render_hyetograph(t_now)
-render_kpis(t_now, totals_up_to(t_now))
-render_gauge(stored_m3[t_now] if t_now < n_min else stored_m3[-1])
-render_cross_section(stored_m3[t_now] if t_now < n_min else stored_m3[-1])
-render_bars(t_now)
+render_maps(t_now)
+render_layouts()
+render_kpis(t_now)
 
-# If running, advance with delay and re-render progressively
+# Main loop for live mode
 if st.session_state.running:
-    # Simulate a few minutes per rerun to feel smooth but responsive
-    step_chunk = 2 if sim_speed == "Fast" else 1
-    target = min(n_min-1, t_now + step_chunk)
-    simulate_until(target)
-    time.sleep(delay)
-    st.rerun()
-
-# Manual step (already applied earlier), re-render after step as well
+    if t_now < n_min-1:
+        st.session_state.t_idx += 1
+        step_once(t_now)  # advance from t_now to t_now+1
+        time.sleep(delay)
+        st.rerun()
+    else:
+        st.session_state.running = False
