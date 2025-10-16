@@ -1,328 +1,298 @@
-# rwabutenge_3d_streamlit.py
-# Streamlit + deck.gl (pydeck) interactive 3D environment for HOPE Rwanda (Rwabutenge, Gahanga, Kicukiro)
-# - Realistic terrain using Mapbox Terrain-RGB (requires a Mapbox token)
-# - Satellite texture draped over terrain using Esri World Imagery (public tile service)
-# - Live 3D buildings from OpenStreetMap via Overpass API (extruded by height / levels)
-# - Adjustable vertical exaggeration, search radius, and building toggles
-# - Optional site boundary (paste GeoJSON)
-#
-# Quick start (locally):
-#   pip install streamlit pydeck requests
-#   (optional) pip install shapely
-#   streamlit run rwabutenge_3d_streamlit.py
-#
-# If you deploy to Streamlit Cloud, set an environment secret named MAPBOX_TOKEN
-
-import os
-import json
-import re
-import math
-import requests
 import streamlit as st
-import pydeck as pdk
+from textwrap import dedent
+import json
 
-# ------------------------- Page setup -------------------------
-st.set_page_config(page_title="HOPE Rwanda – Rwabutenge 3D", layout="wide")
-st.title("HOPE Rwanda: Rwabutenge 3D Environment")
-st.caption("Interactive terrain + satellite + OSM buildings. Tweak the controls in the sidebar.")
+st.set_page_config(page_title="Interactive 3D Forest", layout="wide")
+st.title("🌲 Interactive 3D Environment (Three.js in Streamlit)")
 
-# ------------------------- Sidebar controls -------------------------
-st.sidebar.header("Location & Data Sources")
-# NOTE: If you know the exact coordinates of the site center, set them here.
-# The defaults place you on the SE side of Kigali near Gahanga Sector.
-center_lat = st.sidebar.number_input("Center latitude", value=-2.030, format="%0.6f")
-center_lon = st.sidebar.number_input("Center longitude", value=30.139, format="%0.6f")
+st.sidebar.header("Scene Controls")
+area_size = st.sidebar.slider("World size (meters)", 50, 400, 200, 10)
+tree_count = st.sidebar.slider("Number of trees", 50, 1500, 500, 50)
+min_tree_h = st.sidebar.slider("Min tree height (m)", 2.0, 8.0, 4.0, 0.5)
+max_tree_h = st.sidebar.slider("Max tree height (m)", 6.0, 16.0, 10.0, 0.5)
+wind_strength = st.sidebar.slider("Wind sway (0 = none)", 0.0, 2.0, 0.6, 0.1)
+ground_roughness = st.sidebar.slider("Ground roughness (bump effect)", 0.0, 1.0, 0.35, 0.05)
+fog_density = st.sidebar.slider("Fog density", 0.0, 0.02, 0.006, 0.001)
+show_axes = st.sidebar.checkbox("Show axes helper", False)
+add_pond = st.sidebar.checkbox("Add pond (low area)", True)
 
-radius_m = st.sidebar.slider("Search radius for OSM buildings (m)", min_value=200, max_value=4000, value=1500, step=100)
-
-st.sidebar.header("Rendering & Layers")
-exaggeration = st.sidebar.slider("Vertical exaggeration (×)", min_value=1.0, max_value=8.0, value=2.0, step=0.1)
-show_buildings = st.sidebar.toggle("Show 3D buildings (OSM)", value=True)
-base_opacity = st.sidebar.slider("Satellite texture opacity", 0.2, 1.0, 0.95, 0.05)
-
-st.sidebar.header("Mapbox Token")
-mapbox_token = st.sidebar.text_input(
-    "MAPBOX_TOKEN (required for terrain)",
-    value=os.getenv("MAPBOX_TOKEN", ""),
-    type="password",
-    help="Create one at https://account.mapbox.com. Required for Terrain-RGB elevation tiles."
+PARAMS = dict(
+    area_size=area_size,
+    tree_count=tree_count,
+    min_tree_h=min_tree_h,
+    max_tree_h=max_tree_h,
+    wind_strength=wind_strength,
+    ground_roughness=ground_roughness,
+    fog_density=fog_density,
+    show_axes=show_axes,
+    add_pond=add_pond
 )
 
-st.sidebar.header("Optional Site Boundary")
-use_boundary = st.sidebar.toggle("Overlay site boundary (GeoJSON)", value=False)
-boundary_geojson_text = ""
-if use_boundary:
-    boundary_geojson_text = st.sidebar.text_area(
-        "Paste GeoJSON Feature/FeatureCollection (Polygon/LineString)",
-        value="",
-        height=140,
-        help="Paste a valid GeoJSON geometry for your site boundary."
-    )
+# --- Embed a Three.js scene via HTML ---
+html = f"""
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<style>
+  html, body {{
+    margin: 0; padding: 0; height: 100%; overflow: hidden; background: #a6d0ff;
+    font-family: ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial, "Apple Color Emoji","Segoe UI Emoji";
+  }}
+  #container {{
+    position: relative; width: 100vw; height: 88vh;
+  }}
+  #hud {{
+    position: absolute; left: 12px; bottom: 12px; padding: 10px 12px;
+    background: rgba(0,0,0,0.45); color: #fff; border-radius: 10px; font-size: 13px;
+    line-height: 1.35; backdrop-filter: blur(4px);
+  }}
+  #hud b {{ color: #b6ffb6; }}
+</style>
+</head>
+<body>
+<div id="container"></div>
+<div id="hud">
+  <div><b>Controls</b>: drag = orbit, scroll = zoom, right-drag = pan</div>
+  <div><b>Trees</b>: {tree_count} | <b>World</b>: {area_size}×{area_size} m</div>
+  <div><b>Wind</b>: {wind_strength:.2f} | <b>Fog</b>: {fog_density:.4f}</div>
+</div>
 
-# ------------------------- Helpers -------------------------
-OVERPASS_URL = "https://overpass-api.de/api/interpreter"
+<!-- Three.js from CDN -->
+<script src="https://unpkg.com/three@0.160.0/build/three.min.js"></script>
+<script src="https://unpkg.com/three@0.160.0/examples/js/controls/OrbitControls.js"></script>
 
-@st.cache_data(show_spinner=True, ttl=60*30)
-def fetch_osm_buildings(lat: float, lon: float, radius_m: int):
-    """Fetch building footprints around (lat, lon) within radius using Overpass API.
-    Returns a GeoJSON FeatureCollection with Polygon/MultiPolygon features and 'height' property (m).
-    """
-    # Overpass query: buildings around point
-    # out geom gives node coordinates per way
-    query = f"""
-    [out:json][timeout:25];
-    (
-      way["building"](around:{radius_m},{lat},{lon});
-      relation["building"](around:{radius_m},{lat},{lon});
-    );
-    out body geom tags;
-    """
-    resp = requests.post(OVERPASS_URL, data={"data": query})
-    resp.raise_for_status()
-    data = resp.json()
+<script>
+const CONFIG = {json.dumps(PARAMS)};
+let scene, camera, renderer, controls, treesGroup, clock;
 
-    # Build an index of nodes (not strictly needed when using 'geom')
-    features = []
+function makeCheckerTexture(size=512, squares=16, color1="#6ea96e", color2="#5e905e") {{
+  const c = document.createElement('canvas');
+  c.width = c.height = size;
+  const ctx = c.getContext('2d');
+  const step = size / squares;
+  for (let y=0; y<squares; y++) {{
+    for (let x=0; x<squares; x++) {{
+      ctx.fillStyle = ((x+y)%2==0) ? color1 : color2;
+      ctx.fillRect(x*step, y*step, step, step);
+    }}
+  }}
+  return new THREE.CanvasTexture(c);
+}}
 
-    def parse_height(tags):
-        # Prefer explicit height in meters, else derive from levels (3 m/level)
-        h = None
-        if not tags:
-            return None
-        if "height" in tags:
-            raw = str(tags.get("height"))
-            m = re.match(r"([0-9]*\.?[0-9]+)", raw)
-            if m:
-                h = float(m.group(1))
-        if h is None and ("building:levels" in tags or "levels" in tags):
-            lv_raw = str(tags.get("building:levels", tags.get("levels", "")))
-            m = re.match(r"([0-9]*\.?[0-9]+)", lv_raw)
-            if m:
-                levels = float(m.group(1))
-                h = max(3.0, levels * 3.0)
-        # Fallback modest height
-        if h is None:
-            h = 4.0
-        return float(h)
+function makeNoiseTexture(size=512) {{
+  const c = document.createElement('canvas');
+  c.width = c.height = size;
+  const ctx = c.getContext('2d');
+  const imgData = ctx.createImageData(size, size);
+  for (let i=0; i<imgData.data.length; i+=4) {{
+    const v = 200 + Math.random()*50;
+    imgData.data[i] = v; imgData.data[i+1] = v; imgData.data[i+2] = v; imgData.data[i+3]=255;
+  }}
+  ctx.putImageData(imgData,0,0);
+  return new THREE.CanvasTexture(c);
+}}
 
-    # Convert Overpass ways/relations into GeoJSON
-    for el in data.get("elements", []):
-        el_type = el.get("type")
-        tags = el.get("tags", {})
-        if not tags or "building" not in tags:
-            continue
-        height_m = parse_height(tags)
+function init() {{
+  const container = document.getElementById('container');
+  scene = new THREE.Scene();
 
-        if el_type == "way":
-            geom = el.get("geometry", [])
-            # Ensure closed ring
-            coords = [(p["lon"], p["lat"]) for p in geom]
-            if not coords:
-                continue
-            if coords[0] != coords[-1]:
-                coords.append(coords[0])
-            # Skip tiny or invalid
-            if len(coords) < 4:
-                continue
-            feature = {
-                "type": "Feature",
-                "properties": {
-                    "name": tags.get("name", "building"),
-                    "height": height_m,
-                },
-                "geometry": {
-                    "type": "Polygon",
-                    "coordinates": [coords]
-                }
-            }
-            features.append(feature)
-        elif el_type == "relation":
-            # Basic multipolygon handling
-            members = el.get("members", [])
-            outers = []
-            inners = []
-            for mbr in members:
-                if mbr.get("type") == "way" and "geometry" in mbr:
-                    coords = [(p["lon"], p["lat"]) for p in mbr["geometry"]]
-                    if not coords:
-                        continue
-                    if coords[0] != coords[-1]:
-                        coords.append(coords[0])
-                    if mbr.get("role") == "inner":
-                        inners.append(coords)
-                    else:
-                        outers.append(coords)
-            if outers:
-                geom = {
-                    "type": "MultiPolygon" if len(outers) > 1 else "Polygon",
-                    "coordinates": [outers] if len(outers) > 1 else [outers[0]]
-                }
-                feature = {
-                    "type": "Feature",
-                    "properties": {
-                        "name": tags.get("name", "building"),
-                        "height": height_m,
-                    },
-                    "geometry": geom
-                }
-                features.append(feature)
+  // Fog for depth
+  scene.fog = new THREE.FogExp2(0xa6d0ff, CONFIG.fog_density);
 
-    return {"type": "FeatureCollection", "features": features}
+  const aspect = container.clientWidth / container.clientHeight;
+  camera = new THREE.PerspectiveCamera(55, aspect, 0.1, 2000);
+  camera.position.set(CONFIG.area_size*0.25, Math.max(30, CONFIG.area_size*0.25), CONFIG.area_size*0.25);
 
-# ------------------------- Layers -------------------------
-# Terrain-RGB (Mapbox) elevation tiles
-terrain_url = None
-if mapbox_token:
-    terrain_url = (
-        "https://api.mapbox.com/v4/mapbox.terrain-rgb/{z}/{x}/{y}.pngraw?access_token=" + mapbox_token
-    )
+  renderer = new THREE.WebGLRenderer({{ antialias: true }});
+  renderer.setSize(container.clientWidth, container.clientHeight);
+  renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+  renderer.shadowMap.enabled = true;
+  container.appendChild(renderer.domElement);
 
-# Esri World Imagery for realistic surface texture
-texture_url = "https://services.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}"
+  controls = new THREE.OrbitControls(camera, renderer.domElement);
+  controls.enableDamping = true;
 
-layers = []
+  // Hemi + Directional lights
+  const hemi = new THREE.HemisphereLight(0xb8e4ff, 0x2e4b2e, 0.55);
+  scene.add(hemi);
 
-if terrain_url:
-    terrain = pdk.Layer(
-        "TerrainLayer",
-        data=None,
-        elevation_decoder={  # Mapbox Terrain-RGB decoder
-            "rScaler": 6553.6,  # 256*256*0.1
-            "gScaler": 25.6,    # 256*0.1
-            "bScaler": 0.1,     # 0.1
-            "offset": -10000
-        },
-        texture=texture_url,
-        elevation_data=terrain_url,
-        max_zoom=15,
-        min_zoom=0,
-        strategy='no-overlap',
-        opacity=base_opacity,
-        wireframe=False,
-        elevation_multiplier=exaggeration,
-    )
-    layers.append(terrain)
-else:
-    st.warning("Add a Mapbox token to render 3D terrain. The satellite texture will still appear as a flat basemap.")
-    # Flat imagery as a fallback (BitmapLayer over a large quad)
-    # Define a local bounds around the center to draw imagery bitmap
-    # ~1.5 km square at this latitude
-    dlat = 0.015
-    dlon = 0.015
-    bounds = [
-        [center_lon - dlon, center_lat - dlat],
-        [center_lon - dlon, center_lat + dlat],
-        [center_lon + dlon, center_lat + dlat],
-        [center_lon + dlon, center_lat - dlat],
-    ]
-    layers.append(
-        pdk.Layer(
-            "BitmapLayer",
-            data=None,
-            image=texture_url.replace("{z}", "16").replace("{y}", "24456").replace("{x}", "33212"),
-            bounds=[b for b in bounds],
-            opacity=base_opacity,
-        )
-    )
+  const sun = new THREE.DirectionalLight(0xffffff, 0.9);
+  sun.position.set(200, 300, 100);
+  sun.castShadow = true;
+  sun.shadow.mapSize.set(2048, 2048);
+  scene.add(sun);
 
-# Optional site boundary
-if use_boundary and boundary_geojson_text.strip():
-    try:
-        boundary_obj = json.loads(boundary_geojson_text)
-        # Wrap a single geometry into a Feature if needed
-        if boundary_obj.get("type") in ("Polygon", "LineString", "MultiPolygon", "MultiLineString"):
-            boundary_obj = {"type": "Feature", "properties": {}, "geometry": boundary_obj}
-        # If it's a Feature, wrap to FeatureCollection for pydeck
-        if boundary_obj.get("type") == "Feature":
-            boundary_obj = {"type": "FeatureCollection", "features": [boundary_obj]}
-        boundary_layer = pdk.Layer(
-            "GeoJsonLayer",
-            data=boundary_obj,
-            stroked=True,
-            filled=False,
-            get_line_color=[255, 255, 0, 255],
-            get_line_width=3,
-        )
-        layers.append(boundary_layer)
-    except Exception as e:
-        st.error(f"Boundary GeoJSON parse error: {e}")
+  // Ground plane
+  const gSize = CONFIG.area_size;
+  const groundTex = makeCheckerTexture(1024, 32, "#7fc67f", "#6ab16a");
+  groundTex.wrapS = groundTex.wrapT = THREE.RepeatWrapping;
+  groundTex.repeat.set(4,4);
 
-# Buildings (extruded)
-if show_buildings:
-    with st.spinner("Loading OSM buildings from Overpass…"):
-        try:
-            buildings_geojson = fetch_osm_buildings(center_lat, center_lon, int(radius_m))
-            if buildings_geojson["features"]:
-                bldg_layer = pdk.Layer(
-                    "GeoJsonLayer",
-                    data=buildings_geojson,
-                    extruded=True,
-                    wireframe=False,
-                    opacity=0.9,
-                    get_elevation="properties.height",
-                    get_fill_color="[30, 144, 255, 180]",  # dodgerblue
-                    pickable=True,
-                    auto_highlight=True,
-                )
-                layers.append(bldg_layer)
-            else:
-                st.info("No building footprints returned for this radius.")
-        except Exception as e:
-            st.warning(f"Overpass request failed: {e}")
+  const bumpTex = makeNoiseTexture(512);
+  bumpTex.wrapS = bumpTex.wrapT = THREE.RepeatWrapping;
+  bumpTex.repeat.set(8,8);
 
-# ------------------------- View / Lighting -------------------------
-initial_view = pdk.ViewState(
-    latitude=center_lat,
-    longitude=center_lon,
-    zoom=15.5,
-    pitch=60,
-    bearing=30,
+  const groundMat = new THREE.MeshStandardMaterial({{
+    map: groundTex,
+    roughness: 0.95,
+    metalness: 0.0,
+    bumpMap: bumpTex,
+    bumpScale: CONFIG.ground_roughness * 2.0
+  }});
+  const groundGeo = new THREE.PlaneGeometry(gSize, gSize, 1, 1);
+  const ground = new THREE.Mesh(groundGeo, groundMat);
+  ground.rotation.x = -Math.PI/2;
+  ground.receiveShadow = true;
+  scene.add(ground);
+
+  // Optional pond (simple transparent disc)
+  if (CONFIG.add_pond) {{
+    const pondRadius = gSize * 0.12;
+    const pondGeo = new THREE.CircleGeometry(pondRadius, 64);
+    const pondMat = new THREE.MeshPhysicalMaterial({{
+      color: 0x6aaad6,
+      transmission: 0.85,
+      thickness: 0.5,
+      roughness: 0.15,
+      clearcoat: 1.0,
+      transparent: true,
+      opacity: 0.85
+    }});
+    const pond = new THREE.Mesh(pondGeo, pondMat);
+    pond.rotation.x = -Math.PI/2;
+    pond.position.set(-gSize*0.15, 0.02, gSize*0.1);
+    pond.receiveShadow = true;
+    pond.castShadow = false;
+    scene.add(pond);
+  }}
+
+  if (CONFIG.show_axes) {{
+    scene.add(new THREE.AxesHelper(10));
+  }}
+
+  // Create trees
+  treesGroup = new THREE.Group();
+  scene.add(treesGroup);
+  createTrees();
+
+  // Subtle sky gradient via large inverted sphere
+  const skyGeo = new THREE.SphereGeometry(1500, 32, 32);
+  const skyMat = new THREE.MeshBasicMaterial({{
+    color: 0xa6d0ff,
+    side: THREE.BackSide
+  }});
+  const sky = new THREE.Mesh(skyGeo, skyMat);
+  scene.add(sky);
+
+  window.addEventListener('resize', onResize);
+  clock = new THREE.Clock();
+  animate();
+}}
+
+function randInRange(min, max) {{
+  return min + Math.random()*(max - min);
+}}
+
+function createTrees() {{
+  // Base materials & geometries (instanced for perf)
+  const trunkMat = new THREE.MeshStandardMaterial({{ color: 0x6b4f2e, roughness: 0.9 }});
+  const leafMat  = new THREE.MeshStandardMaterial({{ color: 0x2b7a2b, roughness: 0.7 }});
+  const coneMat2 = new THREE.MeshStandardMaterial({{ color: 0x2f8a2f, roughness: 0.7 }});
+
+  const trunkGeo = new THREE.CylinderGeometry(0.15, 0.25, 1.0, 8);
+  const coneGeo  = new THREE.ConeGeometry(0.8, 1.6, 10);
+  const coneGeo2 = new THREE.ConeGeometry(0.6, 1.2, 10);
+
+  for (let i=0; i<CONFIG.tree_count; i++) {{
+    const h = randInRange(CONFIG.min_tree_h, CONFIG.max_tree_h);
+    const trunkH = h * 0.35;
+    const foliageH = h - trunkH;
+
+    const x = randInRange(-CONFIG.area_size/2+2, CONFIG.area_size/2-2);
+    const z = randInRange(-CONFIG.area_size/2+2, CONFIG.area_size/2-2);
+
+    // Avoid putting trees in the pond
+    const pondCx = -CONFIG.area_size*0.15;
+    const pondCz =  CONFIG.area_size*0.1;
+    const inPond = CONFIG.add_pond && Math.hypot(x-pondCx, z-pondCz) < (CONFIG.area_size*0.12 + 2.5);
+    if (inPond) {{ continue; }}
+
+    // Trunk
+    const trunk = new THREE.Mesh(trunkGeo.clone(), trunkMat);
+    trunk.scale.set(1, trunkH, 1);
+    trunk.position.set(x, trunkH/2, z);
+    trunk.castShadow = true;
+    treesGroup.add(trunk);
+
+    // Foliage (two cones stacked, slight offsets for fuller canopy)
+    const cone = new THREE.Mesh(coneGeo.clone(), leafMat);
+    cone.position.set(x + randInRange(-0.05,0.05), trunkH + foliageH*0.35, z + randInRange(-0.05,0.05));
+    const scale1 = THREE.MathUtils.mapLinear(foliageH, 2.0, 12.0, 0.6, 1.6);
+    cone.scale.set(scale1, THREE.MathUtils.mapLinear(foliageH, 2.0, 12.0, 0.8, 1.8), scale1);
+    cone.castShadow = true;
+    treesGroup.add(cone);
+
+    const cone2 = new THREE.Mesh(coneGeo2.clone(), coneMat2);
+    cone2.position.set(x + randInRange(-0.04,0.04), trunkH + foliageH*0.85, z + randInRange(-0.04,0.04));
+    const scale2 = THREE.MathUtils.mapLinear(foliageH, 2.0, 12.0, 0.5, 1.3);
+    cone2.scale.set(scale2, THREE.MathUtils.mapLinear(foliageH, 2.0, 12.0, 0.8, 1.6), scale2);
+    cone2.castShadow = true;
+    treesGroup.add(cone);
+
+    // Store phase for wind sway
+    const phase = Math.random() * Math.PI * 2;
+    cone.userData.phase = phase;
+    cone2.userData.phase = phase + 0.7;
+  }}
+}}
+
+function onResize() {{
+  const container = document.getElementById('container');
+  camera.aspect = container.clientWidth / container.clientHeight;
+  camera.updateProjectionMatrix();
+  renderer.setSize(container.clientWidth, container.clientHeight);
+}}
+
+function animate() {{
+  requestAnimationFrame(animate);
+  const t = clock.getElapsedTime();
+
+  // Wind sway on foliage
+  const sway = CONFIG.wind_strength * 0.06;
+  treesGroup.children.forEach((obj) => {{
+    // Only sway foliage cones (they have userData.phase)
+    if (obj.userData && typeof obj.userData.phase !== 'undefined') {{
+      const p = obj.userData.phase;
+      obj.rotation.z = Math.sin(t*1.6 + p) * sway;
+      obj.rotation.x = Math.cos(t*1.3 + p*1.2) * sway*0.6;
+    }}
+  }});
+
+  controls.update();
+  renderer.render(scene, camera);
+}}
+
+init();
+</script>
+</body>
+</html>
+"""
+
+# Use components.html to render the scene
+st.components.v1.html(html, height=700, scrolling=False)
+
+st.caption(
+    "Tip: increase “World size” and “Number of trees” for a dense forest; "
+    "raise “Wind sway” to see animated canopies; toggle “Add pond” for variety."
 )
 
-# Nice lighting for 3D
-ambient_light = {
-    "type": "AmbientLight",
-    "color": [255, 255, 255],
-    "intensity": 1.0,
-}
+with st.expander("Notes / Minimal dependencies"):
+    st.markdown(dedent("""
+    - This app uses **Three.js** via CDN inside Streamlit (no extra Python 3D libs required).
+    - You can deploy as-is; your `requirements.txt` only needs `streamlit`.
+    - If you want real terrain or satellite textures later, I can add a map-based version (pydeck TerrainLayer with a Mapbox token).
+    """))
 
-directional_light = {
-    "type": "DirectionalLight",
-    "color": [255, 255, 255],
-    "intensity": 2.0,
-    "direction": [-1, -3, -1],  # sun-ish
-}
-
-effects = [
-    {"type": "LightingEffect", "lights": [ambient_light, directional_light]}
-]
-
-# Tooltip for buildings
-tooltip = {
-    "html": "<b>{name}</b><br/>Height: {height} m",
-    "style": {"backgroundColor": "#2e2e2e", "color": "white"}
-}
-
-# ------------------------- Render deck -------------------------
-r = pdk.Deck(
-    layers=layers,
-    initial_view_state=initial_view,
-    map_provider=None,  # we'll provide our own terrain/imagery
-    views=[pdk.View(type="MapView", controller=True)],
-    effects=effects,
-    tooltip=tooltip,
-)
-
-st.pydeck_chart(r, use_container_width=True)
-
-# ------------------------- Footer hints -------------------------
-st.markdown(
-    """
-**Tips**
-- For best realism, provide a valid **Mapbox token** (Terrain-RGB) and keep **satellite opacity** near 1.0.
-- If you know your exact site polygon, toggle **Overlay site boundary** and paste a small GeoJSON.
-- Increase **Vertical exaggeration** to emphasize relief; reduce if peaks look distorted.
-- Expand **Search radius** to load more OSM buildings (larger areas take longer to fetch).
-    """
-)
 
