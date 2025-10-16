@@ -1,309 +1,328 @@
-# app.py
-# ------------------------------------------------------------
-# HOPE Rwanda — Real Terrain + Boundary + Rain & Mounds (3D)
-# - Real elevation via AWS Terrarium tiles (no tokens)
-# - Satellite imagery (Carto) draped on terrain
-# - Boundary from built-in polygon OR user-uploaded GeoJSON
-# - Rainfall + CN runoff (SCS-CN), mound storage & aging
-# - Mounds rendered as 3D columns; boundary/road overlays
-# ------------------------------------------------------------
-import json
-import math
-from typing import List, Tuple
+# rwabutenge_3d_streamlit.py
+# Streamlit + deck.gl (pydeck) interactive 3D environment for HOPE Rwanda (Rwabutenge, Gahanga, Kicukiro)
+# - Realistic terrain using Mapbox Terrain-RGB (requires a Mapbox token)
+# - Satellite texture draped over terrain using Esri World Imagery (public tile service)
+# - Live 3D buildings from OpenStreetMap via Overpass API (extruded by height / levels)
+# - Adjustable vertical exaggeration, search radius, and building toggles
+# - Optional site boundary (paste GeoJSON)
+#
+# Quick start (locally):
+#   pip install streamlit pydeck requests
+#   (optional) pip install shapely
+#   streamlit run rwabutenge_3d_streamlit.py
+#
+# If you deploy to Streamlit Cloud, set an environment secret named MAPBOX_TOKEN
 
-import numpy as np
+import os
+import json
+import re
+import math
+import requests
 import streamlit as st
 import pydeck as pdk
 
+# ------------------------- Page setup -------------------------
+st.set_page_config(page_title="HOPE Rwanda – Rwabutenge 3D", layout="wide")
+st.title("HOPE Rwanda: Rwabutenge 3D Environment")
+st.caption("Interactive terrain + satellite + OSM buildings. Tweak the controls in the sidebar.")
 
-st.set_page_config(page_title="HOPE Rwanda 3D – Terrain + Rain + Mounds", layout="wide")
-st.title("🌍 HOPE Rwanda — Real Terrain + Rain & Hügelkultur (3D)")
+# ------------------------- Sidebar controls -------------------------
+st.sidebar.header("Location & Data Sources")
+# NOTE: If you know the exact coordinates of the site center, set them here.
+# The defaults place you on the SE side of Kigali near Gahanga Sector.
+center_lat = st.sidebar.number_input("Center latitude", value=-2.030, format="%0.6f")
+center_lon = st.sidebar.number_input("Center longitude", value=30.139, format="%0.6f")
 
-# --- Site center (approx: Rwabutenge, Gahanga Sector, Kicukiro) ---
-SITE_LAT, SITE_LON = -2.0120, 30.1400
+radius_m = st.sidebar.slider("Search radius for OSM buildings (m)", min_value=200, max_value=4000, value=1500, step=100)
 
+st.sidebar.header("Rendering & Layers")
+exaggeration = st.sidebar.slider("Vertical exaggeration (×)", min_value=1.0, max_value=8.0, value=2.0, step=0.1)
+show_buildings = st.sidebar.toggle("Show 3D buildings (OSM)", value=True)
+base_opacity = st.sidebar.slider("Satellite texture opacity", 0.2, 1.0, 0.95, 0.05)
 
-# =========================
-# Helpers (units & geometry)
-# =========================
-def offset_meters(lat: float, lon: float, dx_m: float, dy_m: float) -> Tuple[float, float]:
-    """Return (lat, lon) moved dx east, dy north in meters from (lat, lon)."""
-    dlat = dy_m / 111_320.0
-    dlon = dx_m / (111_320.0 * math.cos(math.radians(lat)))
-    return lat + dlat, lon + dlon
+st.sidebar.header("Mapbox Token")
+mapbox_token = st.sidebar.text_input(
+    "MAPBOX_TOKEN (required for terrain)",
+    value=os.getenv("MAPBOX_TOKEN", ""),
+    type="password",
+    help="Create one at https://account.mapbox.com. Required for Terrain-RGB elevation tiles."
+)
 
+st.sidebar.header("Optional Site Boundary")
+use_boundary = st.sidebar.toggle("Overlay site boundary (GeoJSON)", value=False)
+boundary_geojson_text = ""
+if use_boundary:
+    boundary_geojson_text = st.sidebar.text_area(
+        "Paste GeoJSON Feature/FeatureCollection (Polygon/LineString)",
+        value="",
+        height=140,
+        help="Paste a valid GeoJSON geometry for your site boundary."
+    )
 
-def meters_from_latlon(lat0: float, lon0: float, lat: float, lon: float) -> Tuple[float, float]:
-    """Approx convert a lat/lon to (x,y) meters relative to (lat0, lon0)."""
-    dy = (lat - lat0) * 111_320.0
-    dx = (lon - lon0) * 111_320.0 * math.cos(math.radians(lat0))
-    return dx, dy
+# ------------------------- Helpers -------------------------
+OVERPASS_URL = "https://overpass-api.de/api/interpreter"
 
-
-def polygon_area_m2(coords_lonlat: List[List[float]]) -> float:
-    """Compute polygon area (m²) from lon/lat coords (closed or open)."""
-    if coords_lonlat[0] != coords_lonlat[-1]:
-        coords_lonlat = coords_lonlat + [coords_lonlat[0]]
-    # reference at centroid for better accuracy
-    lats = [c[1] for c in coords_lonlat]
-    lons = [c[0] for c in coords_lonlat]
-    lat0 = sum(lats) / len(lats)
-    lon0 = sum(lons) / len(lons)
-    xy = [meters_from_latlon(lat0, lon0, lat, lon) for lon, lat in coords_lonlat]
-
-    # shoelace
-    area2 = 0.0
-    for (x1, y1), (x2, y2) in zip(xy[:-1], xy[1:]):
-        area2 += x1 * y2 - x2 * y1
-    return abs(area2) / 2.0
-
-
-def scs_runoff_depth_mm(P_mm: float, CN: float) -> float:
+@st.cache_data(show_spinner=True, ttl=60*30)
+def fetch_osm_buildings(lat: float, lon: float, radius_m: int):
+    """Fetch building footprints around (lat, lon) within radius using Overpass API.
+    Returns a GeoJSON FeatureCollection with Polygon/MultiPolygon features and 'height' property (m).
     """
-    SCS-CN runoff depth (mm).
-    S = 25400/CN - 254 (mm); Ia = 0.2*S
-    Q = (P - Ia)^2 / (P - Ia + S), for P > Ia; else 0
+    # Overpass query: buildings around point
+    # out geom gives node coordinates per way
+    query = f"""
+    [out:json][timeout:25];
+    (
+      way["building"](around:{radius_m},{lat},{lon});
+      relation["building"](around:{radius_m},{lat},{lon});
+    );
+    out body geom tags;
     """
-    CN = float(np.clip(CN, 1, 100))
-    S = 25400.0 / CN - 254.0
-    Ia = 0.2 * S
-    if P_mm <= Ia:
-        return 0.0
-    return ((P_mm - Ia) ** 2) / (P_mm - Ia + S)
+    resp = requests.post(OVERPASS_URL, data={"data": query})
+    resp.raise_for_status()
+    data = resp.json()
 
+    # Build an index of nodes (not strictly needed when using 'geom')
+    features = []
 
-# ======================
-# Sidebar: Inputs/Sliders
-# ======================
-st.sidebar.header("Camera")
-zoom = st.sidebar.slider("Zoom", 10.0, 18.0, 15.0, 0.1)
-pitch = st.sidebar.slider("Pitch", 0, 75, 60, 1)
-bearing = st.sidebar.slider("Bearing", -180, 180, 30, 1)
+    def parse_height(tags):
+        # Prefer explicit height in meters, else derive from levels (3 m/level)
+        h = None
+        if not tags:
+            return None
+        if "height" in tags:
+            raw = str(tags.get("height"))
+            m = re.match(r"([0-9]*\.?[0-9]+)", raw)
+            if m:
+                h = float(m.group(1))
+        if h is None and ("building:levels" in tags or "levels" in tags):
+            lv_raw = str(tags.get("building:levels", tags.get("levels", "")))
+            m = re.match(r"([0-9]*\.?[0-9]+)", lv_raw)
+            if m:
+                levels = float(m.group(1))
+                h = max(3.0, levels * 3.0)
+        # Fallback modest height
+        if h is None:
+            h = 4.0
+        return float(h)
 
-st.sidebar.header("Data & Layers")
-geojson_file = st.sidebar.file_uploader("Optional: Upload boundary (GeoJSON Polygon)", type=["geojson", "json"])
-show_boundary = st.sidebar.checkbox("Show boundary", True)
-show_road = st.sidebar.checkbox("Show dirt road", True)
-show_buildings = st.sidebar.checkbox("Show small buildings", True)
+    # Convert Overpass ways/relations into GeoJSON
+    for el in data.get("elements", []):
+        el_type = el.get("type")
+        tags = el.get("tags", {})
+        if not tags or "building" not in tags:
+            continue
+        height_m = parse_height(tags)
 
-st.sidebar.header("Rain & Runoff")
-P = st.sidebar.slider("Storm rainfall (mm)", 10, 1400, 120, 10)
-CN = st.sidebar.slider("Curve Number (higher = more runoff)", 55, 95, 80)
+        if el_type == "way":
+            geom = el.get("geometry", [])
+            # Ensure closed ring
+            coords = [(p["lon"], p["lat"]) for p in geom]
+            if not coords:
+                continue
+            if coords[0] != coords[-1]:
+                coords.append(coords[0])
+            # Skip tiny or invalid
+            if len(coords) < 4:
+                continue
+            feature = {
+                "type": "Feature",
+                "properties": {
+                    "name": tags.get("name", "building"),
+                    "height": height_m,
+                },
+                "geometry": {
+                    "type": "Polygon",
+                    "coordinates": [coords]
+                }
+            }
+            features.append(feature)
+        elif el_type == "relation":
+            # Basic multipolygon handling
+            members = el.get("members", [])
+            outers = []
+            inners = []
+            for mbr in members:
+                if mbr.get("type") == "way" and "geometry" in mbr:
+                    coords = [(p["lon"], p["lat"]) for p in mbr["geometry"]]
+                    if not coords:
+                        continue
+                    if coords[0] != coords[-1]:
+                        coords.append(coords[0])
+                    if mbr.get("role") == "inner":
+                        inners.append(coords)
+                    else:
+                        outers.append(coords)
+            if outers:
+                geom = {
+                    "type": "MultiPolygon" if len(outers) > 1 else "Polygon",
+                    "coordinates": [outers] if len(outers) > 1 else [outers[0]]
+                }
+                feature = {
+                    "type": "Feature",
+                    "properties": {
+                        "name": tags.get("name", "building"),
+                        "height": height_m,
+                    },
+                    "geometry": geom
+                }
+                features.append(feature)
 
-st.sidebar.header("Hügelkultur")
-use_hugel = st.sidebar.checkbox("Enable mounds", True)
-mound_count = st.sidebar.slider("Mounds count", 0, 120, 28, 1)
-mound_radius_m = st.sidebar.slider("Mound radius (m)", 2, 12, 6, 1)
-mound_height_m = st.sidebar.slider("Initial mound height (m)", 0.2, 1.6, 0.8, 0.1)
-core_porosity = st.sidebar.slider("Core porosity (0–1)", 0.2, 0.9, 0.6, 0.05)
-years = st.sidebar.slider("Years (settling & decomposition)", 0, 15, 3, 1)
+    return {"type": "FeatureCollection", "features": features}
 
-# Aging curve: height → 40% by ~10 yrs; porosity soft-declines to 70% of initial
-aging_h = float(np.exp(-years / 10.0) * 0.6 + 0.4)
-aging_p = 0.7 + 0.3 * np.exp(-years / 8.0)
+# ------------------------- Layers -------------------------
+# Terrain-RGB (Mapbox) elevation tiles
+terrain_url = None
+if mapbox_token:
+    terrain_url = (
+        "https://api.mapbox.com/v4/mapbox.terrain-rgb/{z}/{x}/{y}.pngraw?access_token=" + mapbox_token
+    )
 
-# ======================
-# Boundary (built-in or uploaded)
-# ======================
-if geojson_file:
-    try:
-        gj = json.load(geojson_file)
-        # Handle FeatureCollection or bare Polygon
-        if gj.get("type") == "FeatureCollection":
-            geom = gj["features"][0]["geometry"]
-        elif gj.get("type") == "Feature":
-            geom = gj["geometry"]
-        else:
-            geom = gj
-        # Expect Polygon (first ring)
-        ring = geom["coordinates"][0]
-        boundary_coords = [[float(x), float(y)] for x, y in ring]
-    except Exception as e:
-        st.warning(f"Failed to parse GeoJSON: {e}. Falling back to built-in polygon.")
-        geojson_file = None
-        boundary_coords = None
+# Esri World Imagery for realistic surface texture
+texture_url = "https://services.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}"
+
+layers = []
+
+if terrain_url:
+    terrain = pdk.Layer(
+        "TerrainLayer",
+        data=None,
+        elevation_decoder={  # Mapbox Terrain-RGB decoder
+            "rScaler": 6553.6,  # 256*256*0.1
+            "gScaler": 25.6,    # 256*0.1
+            "bScaler": 0.1,     # 0.1
+            "offset": -10000
+        },
+        texture=texture_url,
+        elevation_data=terrain_url,
+        max_zoom=15,
+        min_zoom=0,
+        strategy='no-overlap',
+        opacity=base_opacity,
+        wireframe=False,
+        elevation_multiplier=exaggeration,
+    )
+    layers.append(terrain)
 else:
-    boundary_coords = None
-
-if boundary_coords is None:
-    # Rough parcel polygon (meters offsets from site center), inspired by your screenshot
-    poly_offsets_m = [
-        (-800, -800), (-700, +800), (+100, +900), (+900, +800),
-        (+950, -200), (+700, -600), (+300, -500), (0, -700),
-        (-300, -580), (-650, -650), (-800, -800)
+    st.warning("Add a Mapbox token to render 3D terrain. The satellite texture will still appear as a flat basemap.")
+    # Flat imagery as a fallback (BitmapLayer over a large quad)
+    # Define a local bounds around the center to draw imagery bitmap
+    # ~1.5 km square at this latitude
+    dlat = 0.015
+    dlon = 0.015
+    bounds = [
+        [center_lon - dlon, center_lat - dlat],
+        [center_lon - dlon, center_lat + dlat],
+        [center_lon + dlon, center_lat + dlat],
+        [center_lon + dlon, center_lat - dlat],
     ]
-    boundary_coords = []
-    for dx, dy in poly_offsets_m:
-        lat, lon = offset_meters(SITE_LAT, SITE_LON, dx, dy)
-        boundary_coords.append([lon, lat])
-
-# Area used for hydrology (m²)
-try:
-    area_m2 = polygon_area_m2(boundary_coords)
-except Exception:
-    # If something goes wrong, use a 320m × 320m fallback
-    area_m2 = 320.0 * 320.0
-
-# ======================================
-# Layers: Terrain + Overlays (road/builds)
-# ======================================
-# Terrain: AWS Terrarium elevation + Carto satellite; no API key required
-terrain = pdk.Layer(
-    "TerrainLayer",
-    data=None,
-    elevation_decoder={"rScaler": 256.0, "gScaler": 1.0, "bScaler": 1.0/256.0, "offset": -32768.0},
-    texture="https://basemaps.cartocdn.com/rastertiles/satellite/{z}/{x}/{y}.png",
-    elevation_data="https://s3.amazonaws.com/elevation-tiles-prod/terrarium/{z}/{x}/{y}.png",
-    wireframe=False,
-    max_zoom=18,
-    opacity=1.0,
-)
-
-layers = [terrain]
-
-# Boundary polygon layer
-if show_boundary:
-    boundary_layer = pdk.Layer(
-        "PolygonLayer",
-        data=[{"polygon": boundary_coords}],
-        get_polygon="polygon",
-        get_fill_color=[0, 180, 255, 40],
-        get_line_color=[0, 180, 255, 220],
-        line_width_min_pixels=2,
-        stroked=True,
-        filled=True,
-        extruded=False,
-        pickable=False,
+    layers.append(
+        pdk.Layer(
+            "BitmapLayer",
+            data=None,
+            image=texture_url.replace("{z}", "16").replace("{y}", "24456").replace("{x}", "33212"),
+            bounds=[b for b in bounds],
+            opacity=base_opacity,
+        )
     )
-    layers.append(boundary_layer)
 
-# Simple dirt road polyline
-if show_road:
-    road_offsets = [(-700, +700), (-300, +300), (-60, +80), (+40, -200), (0, -500)]
-    road_coords = []
-    for dx, dy in road_offsets:
-        lat, lon = offset_meters(SITE_LAT, SITE_LON, dx, dy)
-        road_coords.append([lon, lat])
-    road_layer = pdk.Layer(
-        "PathLayer",
-        data=[{"path": road_coords}],
-        get_path="path",
-        get_color=[190, 130, 70],
-        width_scale=1,
-        width_min_pixels=4,
-        get_width=5,
-        pickable=False,
-    )
-    layers.append(road_layer)
+# Optional site boundary
+if use_boundary and boundary_geojson_text.strip():
+    try:
+        boundary_obj = json.loads(boundary_geojson_text)
+        # Wrap a single geometry into a Feature if needed
+        if boundary_obj.get("type") in ("Polygon", "LineString", "MultiPolygon", "MultiLineString"):
+            boundary_obj = {"type": "Feature", "properties": {}, "geometry": boundary_obj}
+        # If it's a Feature, wrap to FeatureCollection for pydeck
+        if boundary_obj.get("type") == "Feature":
+            boundary_obj = {"type": "FeatureCollection", "features": [boundary_obj]}
+        boundary_layer = pdk.Layer(
+            "GeoJsonLayer",
+            data=boundary_obj,
+            stroked=True,
+            filled=False,
+            get_line_color=[255, 255, 0, 255],
+            get_line_width=3,
+        )
+        layers.append(boundary_layer)
+    except Exception as e:
+        st.error(f"Boundary GeoJSON parse error: {e}")
 
-# Small “buildings” near south edge
+# Buildings (extruded)
 if show_buildings:
-    b_offsets = [(-300, -650), (+50, -700), (+380, -720)]
-    b_data = []
-    for dx, dy in b_offsets:
-        lat, lon = offset_meters(SITE_LAT, SITE_LON, dx, dy)
-        b_data.append({"pos": [lon, lat], "height": 3.5, "radius": 8})
-    buildings_layer = pdk.Layer(
-        "ColumnLayer",
-        data=b_data,
-        get_position="pos",
-        get_elevation="height",
-        elevation_scale=1,
-        radius_units="meters",
-        get_radius="radius",
-        get_fill_color=[240, 240, 240, 220],
-        extruded=True,
-        pickable=False,
-    )
-    layers.append(buildings_layer)
+    with st.spinner("Loading OSM buildings from Overpass…"):
+        try:
+            buildings_geojson = fetch_osm_buildings(center_lat, center_lon, int(radius_m))
+            if buildings_geojson["features"]:
+                bldg_layer = pdk.Layer(
+                    "GeoJsonLayer",
+                    data=buildings_geojson,
+                    extruded=True,
+                    wireframe=False,
+                    opacity=0.9,
+                    get_elevation="properties.height",
+                    get_fill_color="[30, 144, 255, 180]",  # dodgerblue
+                    pickable=True,
+                    auto_highlight=True,
+                )
+                layers.append(bldg_layer)
+            else:
+                st.info("No building footprints returned for this radius.")
+        except Exception as e:
+            st.warning(f"Overpass request failed: {e}")
 
-# Hügelkultur mounds inside the boundary
-if use_hugel and mound_count > 0:
-    # Build a simple bounding box to sample positions; a true "point-in-polygon"
-    # sampler is overkill here — we’ll bias points toward the polygon’s interior.
-    lons = [c[0] for c in boundary_coords]
-    lats = [c[1] for c in boundary_coords]
-    lon_min, lon_max = min(lons), max(lons)
-    lat_min, lat_max = min(lats), max(lats)
+# ------------------------- View / Lighting -------------------------
+initial_view = pdk.ViewState(
+    latitude=center_lat,
+    longitude=center_lon,
+    zoom=15.5,
+    pitch=60,
+    bearing=30,
+)
 
-    rng = np.random.default_rng(2025)
-    m_data = []
-    tries = 0
-    while len(m_data) < mound_count and tries < mound_count * 50:
-        tries += 1
-        lon = rng.uniform(lon_min, lon_max)
-        lat = rng.uniform(lat_min, lat_max)
-        # quick winding-test substitute: use pydeck to render regardless,
-        # but we loosely keep 90% of random points to avoid heavy compute
-        if rng.random() < 0.9:
-            height = mound_height_m * aging_h * rng.uniform(0.7, 1.2)
-            m_data.append({"pos": [lon, lat], "height": height, "radius": mound_radius_m})
+# Nice lighting for 3D
+ambient_light = {
+    "type": "AmbientLight",
+    "color": [255, 255, 255],
+    "intensity": 1.0,
+}
 
-    mounds_layer = pdk.Layer(
-        "ColumnLayer",
-        data=m_data,
-        get_position="pos",
-        get_elevation="height",
-        elevation_scale=1,
-        radius_units="meters",
-        get_radius="radius",
-        get_fill_color=[34, 139, 34, 200],  # green-ish
-        extruded=True,
-        pickable=False,
-    )
-    layers.append(mounds_layer)
+directional_light = {
+    "type": "DirectionalLight",
+    "color": [255, 255, 255],
+    "intensity": 2.0,
+    "direction": [-1, -3, -1],  # sun-ish
+}
 
-# View
-view = pdk.ViewState(latitude=SITE_LAT, longitude=SITE_LON, zoom=zoom, pitch=pitch, bearing=bearing)
+effects = [
+    {"type": "LightingEffect", "lights": [ambient_light, directional_light]}
+]
 
-deck = pdk.Deck(
+# Tooltip for buildings
+tooltip = {
+    "html": "<b>{name}</b><br/>Height: {height} m",
+    "style": {"backgroundColor": "#2e2e2e", "color": "white"}
+}
+
+# ------------------------- Render deck -------------------------
+r = pdk.Deck(
     layers=layers,
-    initial_view_state=view,
-    map_provider="carto",       # tokenless satellite tiles
-    map_style="satellite",
-    tooltip={"text": "HOPE Rwanda — 3D terrain"},
+    initial_view_state=initial_view,
+    map_provider=None,  # we'll provide our own terrain/imagery
+    views=[pdk.View(type="MapView", controller=True)],
+    effects=effects,
+    tooltip=tooltip,
 )
 
-# Layout
-map_col, metrics_col = st.columns([0.64, 0.36], gap="large")
-with map_col:
-    st.pydeck_chart(deck, use_container_width=True)
+st.pydeck_chart(r, use_container_width=True)
 
-# ======================
-# Hydrology quick calc
-# ======================
-# Storm volumes
-rain_m3 = (P / 1000.0) * area_m2
-Q_mm = scs_runoff_depth_mm(P, CN)
-runoff_m3 = (Q_mm / 1000.0) * area_m2
-retained_m3 = max(rain_m3 - runoff_m3, 0.0)
-
-# Mound storage (very simple): sum of cylinder volumes × core porosity × aging
-# V_each ≈ π r^2 h; effective_porosity = core_porosity * aging_p
-effective_porosity = float(core_porosity * aging_p)
-mound_V_m3 = mound_count * (math.pi * mound_radius_m**2 * (mound_height_m * aging_h)) * effective_porosity
-
-with metrics_col:
-    st.subheader("Rain & Storage (Quick Estimates)")
-    c1, c2 = st.columns(2)
-    c1.metric("Boundary area", f"{area_m2:,.0f} m²")
-    c2.metric("Rain depth", f"{P} mm")
-
-    c3, c4 = st.columns(2)
-    c3.metric("Rain volume", f"{rain_m3:,.0f} m³")
-    c4.metric("Runoff (SCS-CN)", f"{runoff_m3:,.0f} m³", f"CN {CN}")
-
-    c5, c6 = st.columns(2)
-    c5.metric("Retained/Infiltrated", f"{retained_m3:,.0f} m³")
-    c6.metric("Mound storage (est.)", f"{mound_V_m3:,.0f} m³", f"porosity×aging={effective_porosity:.2f}")
-
-    st.caption(
-        "Notes: Runoff uses SCS-CN (event-based) with depth P and Curve Number CN. "
-        "Mound storage is a simplified estimate (cylindrical volume × core porosity × aging). "
-        "Aging reduces mound height and porosity over time, reflecting settling/decomposition."
-    )
-
-st.info(
-    "Tips: Lower **CN** (more permeable cover/soils) to reduce runoff; "
-    "increase mound radius/count to boost storage. Upload a GeoJSON boundary to match your exact site."
+# ------------------------- Footer hints -------------------------
+st.markdown(
+    """
+**Tips**
+- For best realism, provide a valid **Mapbox token** (Terrain-RGB) and keep **satellite opacity** near 1.0.
+- If you know your exact site polygon, toggle **Overlay site boundary** and paste a small GeoJSON.
+- Increase **Vertical exaggeration** to emphasize relief; reduce if peaks look distorted.
+- Expand **Search radius** to load more OSM buildings (larger areas take longer to fetch).
+    """
 )
+
