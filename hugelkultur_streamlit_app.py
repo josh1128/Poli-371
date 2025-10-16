@@ -3,7 +3,7 @@
 # - Land cover: forests, ground, buildings/roads that follow terrain logic
 # - Hydrology: SCS-CN runoff + simple D8 routing (toy model)
 # - 3D interactive Plotly surface (drag/zoom) + water overlay
-# - Fixes: "near_road" neighborhood growth; settlement_score normalized as NumPy array
+# - Fixes: robust settlement_score normalization; safe near_road growth
 
 import math
 import time
@@ -130,11 +130,16 @@ near[:, :-1] |= road_mask[:, 1:]
 near[:, 1:]  |= road_mask[:, :-1]
 near_road = road_mask | near
 
+# --- settlement_score with robust normalization (no .ptp) ---
 settlement_score = gentle.astype(float) * 0.6 + near_road.astype(float) * 1.2
-settlement_score += 0.3 * fbm_noise(H, W, octaves=2, persistence=0.7, rng=rng_local)
-# --- FIXED: ensure NumPy array before normalization ---
-settlement_score = np.asarray(settlement_score, dtype=float)
-settlement_score = (settlement_score - settlement_score.min()) / (settlement_score.ptp() + 1e-9)
+settlement_noise = 0.3 * fbm_noise(H, W, octaves=2, persistence=0.7, rng=rng_local)
+settlement_score = settlement_score + settlement_noise
+settlement_score = np.array(settlement_score, dtype=np.float64, copy=False)
+settlement_min = float(np.nanmin(settlement_score))
+settlement_ptp = float(np.nanmax(settlement_score) - settlement_min)
+if settlement_ptp == 0:
+    settlement_ptp = 1e-9
+settlement_score = (settlement_score - settlement_min) / settlement_ptp
 
 target_build = int(W*H*build_share)
 buildings = np.zeros((H, W), dtype=bool)
