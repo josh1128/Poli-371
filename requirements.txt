@@ -5,3 +5,7 @@ folium>=0.15.0
 streamlit-folium>=0.20.0
 plotly>=5.22
 pydeck
+lonboard>=0.6
+geopandas>=0.14
+pyogrio>=0.9
+shapely>=2.0
