@@ -1,345 +1,277 @@
-# app.py — 3D Interactive Mini World (HOPE Rwanda)
-# - Realistic synthetic terrain (fractal noise + southward slope)
-# - Land cover: forests, ground, buildings/roads that follow terrain logic
-# - Hydrology: SCS-CN runoff + simple D8 routing (toy model)
-# - 3D interactive Plotly surface (drag/zoom) + water overlay
-# - Fixes: robust settlement_score normalization; safe near_road growth
-
+# app.py
+# ------------------------------------------------------------
+# Interactive 3D Mini-World (Streamlit + Plotly)
+# - Procedural terrain (no external data)
+# - Kigali-like parcel boundary, road, simple buildings
+# - Optional hügelkultur mounds with aging/settling
+# - Rainfall + SCS-CN runoff quick calc
+# ------------------------------------------------------------
 import math
-import time
+from typing import Tuple
+
 import numpy as np
-import streamlit as st
 import plotly.graph_objects as go
+import streamlit as st
 
-# -------------------- Page setup --------------------
-st.set_page_config(page_title="3D Mini World – HOPE Rwanda", layout="wide")
-st.title("3D Mini World – HOPE Rwanda (Stormwater)")
 
-with st.expander("About this simulator"):
-    st.markdown(
-        """
-A schematic hillslope inspired by Kigali’s terrain. It generates terrain, places roads/buildings and forests
-based on slope/elevation, and simulates storm **runoff vs infiltration** per cell (SCS-CN) with a simple **downhill routing**.
-Use it for **relative comparisons** (e.g., more forest, fewer roads) — not for engineering design.
-        """
+# ---------- Helpers ----------
+def make_grid(n: int, size_m: float) -> Tuple[np.ndarray, np.ndarray]:
+    """Return X, Y coordinate grids from 0..size_m."""
+    xs = np.linspace(0, size_m, n)
+    ys = np.linspace(0, size_m, n)
+    X, Y = np.meshgrid(xs, ys)
+    return X, Y
+
+
+def smooth_rand(n: int, k: float, seed: int) -> np.ndarray:
+    """
+    Fast 'soft' noise without extra deps: sum of a few sin/cos bases
+    plus seeded randomness, then gentle blur via rolling mean.
+    k controls hilliness scale (bigger = broader hills).
+    """
+    rng = np.random.default_rng(seed)
+    x = np.linspace(0, 2 * np.pi, n)
+    y = np.linspace(0, 2 * np.pi, n)
+    X, Y = np.meshgrid(x, y)
+
+    # A few smooth basis fields
+    Z = (
+        0.45 * np.sin(X / k + 0.7) * np.cos(Y / k + 1.3)
+        + 0.35 * np.cos(1.7 * X / k) * np.sin(1.2 * Y / k)
+        + 0.20 * np.sin(0.7 * X / k + 0.9) * np.sin(0.6 * Y / k + 0.4)
     )
 
-# -------------------- Sidebar controls --------------------
-st.sidebar.header("World & realism")
-W = st.sidebar.slider("Width (cells)", 80, 220, 140, 10)
-H = st.sidebar.slider("Height (cells)", 60, 180, 110, 10)
-seed = st.sidebar.number_input("Random seed", value=7, step=1)
+    # Add a gentle random field and roll-mean blur
+    R = rng.normal(0, 0.2, size=(n, n))
+    R = (np.roll(R, 1, 0) + R + np.roll(R, -1, 0) + np.roll(R, 1, 1) + np.roll(R, -1, 1)) / 5.0
+    Z = Z + 0.25 * R
+    # Normalize 0..1
+    Z = (Z - Z.min()) / (Z.max() - Z.min() + 1e-9)
+    return Z
 
-relief = st.sidebar.slider("Relief (vertical range)", 0.4, 1.8, 1.0, 0.05)
-roughness = st.sidebar.slider("Terrain roughness (octaves)", 1, 7, 4, 1)
-slope_bias = st.sidebar.slider("Southward slope bias", 0.10, 1.00, 0.55, 0.05)
-valley_focus = st.sidebar.slider("Valley emphasis", 0.00, 1.00, 0.35, 0.05)
 
-st.sidebar.header("Land cover")
-forest_share = st.sidebar.slider("Target forest share (%)", 10, 80, 40, 5) / 100.0
-build_share  = st.sidebar.slider("Target buildings/roads share (%)", 5, 35, 12, 1) / 100.0
+def add_gaussian_bump(Z: np.ndarray, cx: float, cy: float, amp: float, sigma: float) -> None:
+    """Add a smooth hill (+) or trench (−) at center (cx, cy) in grid coords."""
+    n = Z.shape[0]
+    xs = np.linspace(0, 1, n)
+    ys = np.linspace(0, 1, n)
+    X, Y = np.meshgrid(xs, ys)
+    Z += amp * np.exp(-(((X - cx) ** 2 + (Y - cy) ** 2) / (2 * sigma**2)))
 
-st.sidebar.header("Soil moisture (affects CN)")
-soil_state = st.sidebar.select_slider("Antecedent moisture", ["Dry", "Average", "Wet"], value="Average")
 
-st.sidebar.header("Road network")
-curvy = st.sidebar.slider("Road curviness", 0.0, 1.0, 0.55, 0.05)
-spurs = st.sidebar.slider("Side roads (count)", 0, 6, 3, 1)
+def carve_polyline_trench(Z: np.ndarray, pts01: list, depth: float, width: float) -> None:
+    """Lower elevation along a polyline (simple road/valley)."""
+    n = Z.shape[0]
+    xs = np.linspace(0, 1, n)
+    ys = np.linspace(0, 1, n)
+    X, Y = np.meshgrid(xs, ys)
 
-st.sidebar.header("Storm & animation")
-storm_mm = st.sidebar.slider("Total storm depth (mm)", 0, 1400, 180, 10)
-steps = st.sidebar.slider("Animation steps", 10, 180, 60, 5)
-frame_delay = st.sidebar.slider("Frame delay (ms)", 0, 120, 25, 5) / 1000.0
+    for (x0, y0), (x1, y1) in zip(pts01[:-1], pts01[1:]):
+        # distance from each cell to the segment
+        vx, vy = x1 - x0, y1 - y0
+        wx, wy = X - x0, Y - y0
+        c1 = vx * wx + vy * wy
+        c2 = vx * vx + vy * vy + 1e-12
+        t = np.clip(c1 / c2, 0, 1)
+        projx = x0 + t * vx
+        projy = y0 + t * vy
+        d = np.sqrt((X - projx) ** 2 + (Y - projy) ** 2)
+        Z -= depth * np.exp(-((d**2) / (2 * width**2)))
 
-rng = np.random.default_rng(int(seed))
 
-# -------------------- Terrain synthesis --------------------
-def fbm_noise(h, w, octaves=4, persistence=0.5, lacunarity=2.0, rng=None):
-    """Fractal Brownian Motion using tiled blurred noise (fast & dependency-free)."""
-    base = np.zeros((h, w), dtype=float)
-    for o in range(octaves):
-        freq = lacunarity ** o
-        sh = max(2, int(h / freq))
-        sw = max(2, int(w / freq))
-        n = rng.normal(0, 1, size=(sh, sw))
-        up = np.kron(n, np.ones((math.ceil(h/sh), math.ceil(w/sw))))
-        up = up[:h, :w]
-        base += (persistence ** o) * up
-    base = (base - base.min()) / (base.max() - base.min() + 1e-9)
-    return base
+def polygon_boundary_xy(size_m: float) -> Tuple[np.ndarray, np.ndarray]:
+    """
+    Rough polygon inspired by the screenshot (world coordinates in meters).
+    Returns closed loop.
+    """
+    # Coordinates in 0..1 then scale to meters
+    poly01 = np.array([
+        [0.15, 0.15],
+        [0.18, 0.80],
+        [0.55, 0.85],
+        [0.88, 0.80],
+        [0.90, 0.35],
+        [0.80, 0.20],
+        [0.65, 0.25],
+        [0.50, 0.18],
+        [0.35, 0.22],
+        [0.20, 0.18],
+        [0.15, 0.15],
+    ])
+    return poly01[:, 0] * size_m, poly01[:, 1] * size_m
 
-@st.cache_data(show_spinner=False)
-def build_terrain(h, w, octaves, slope_bias, valley_focus, relief, seed):
-    rng = np.random.default_rng(int(seed))
-    fbm = fbm_noise(h, w, octaves=octaves, persistence=0.55, lacunarity=2.0, rng=rng)
-    south = np.linspace(1.0, 0.0, h).reshape(-1, 1)               # southward tilt (top high → bottom low)
-    x = np.linspace(0, 1, w)[None, :]
-    ridges = 0.15 * np.cos(4 * np.pi * x)                         # gentle E-W undulations
-    base = (slope_bias * south + (1.0 - slope_bias) * fbm + ridges)
-    val = fbm_noise(h, w, octaves=max(1, octaves-1), persistence=0.65, rng=rng)
-    elev = base - valley_focus * val
-    elev = (elev - elev.min()) / (elev.max() - elev.min() + 1e-9)
-    elev = elev ** 1.1                                             # skew for deeper basins
-    elev = elev * relief
-    return elev
 
-elev = build_terrain(H, W, roughness, slope_bias, valley_focus, relief, seed)
+def add_building_blocks(fig, size_m: float, ground_h: float):
+    """Simple extruded 'buildings' as short prisms near the south edge."""
+    bx = np.array([0.30, 0.33, 0.33, 0.30, 0.30]) * size_m
+    by = np.array([0.18, 0.18, 0.22, 0.22, 0.18]) * size_m
+    cx = np.array([0.55, 0.58, 0.58, 0.55, 0.55]) * size_m
+    cy = np.array([0.17, 0.17, 0.21, 0.21, 0.17]) * size_m
 
-# -------------------- Land cover placement --------------------
-def place_roads(elev, curviness=0.6, n_spurs=3, rng=None):
-    H, W = elev.shape
-    road = np.zeros((H, W), dtype=bool)
-    # main curvy polyline at ~1/3 from top
-    r = int(H * (0.30 + 0.1 * rng.random()))
-    c = 0
-    drift = 0
-    while c < W:
-        road[max(0, r-1):min(H, r+2), max(0, c-2):min(W, c+3)] = True
-        drift += rng.normal(0, curviness*0.8)
-        r = int(np.clip(r + np.tanh(drift), 2, H-3))
-        c += 2
-    # side spurs generally downhill
-    for _ in range(n_spurs):
-        c0 = rng.integers(low=int(W*0.1), high=int(W*0.9))
-        rows_with_road = np.where(road[:, c0])[0]
-        if rows_with_road.size == 0:
-            continue
-        r0 = int(rows_with_road[0])
-        r = r0; c = c0
-        length = rng.integers(low=int(H*0.15), high=int(H*0.35))
-        for _ in range(length):
-            road[max(0, r-1):min(H, r+2), max(0, c-1):min(W, c+2)] = True
-            win = elev[max(0,r-1):min(H,r+2), max(0,c-1):min(W,c+2)]
-            rr, cc = np.unravel_index(np.argmin(win), win.shape)
-            r = int(np.clip((r-1)+rr, 1, H-2))
-            c = int(np.clip((c-1)+cc, 1, W-2))
-    return road
+    for xs, ys in [(bx, by), (cx, cy)]:
+        fig.add_trace(
+            go.Scatter3d(
+                x=xs,
+                y=ys,
+                z=[ground_h, ground_h, ground_h + 3, ground_h + 3, ground_h],
+                mode="lines",
+                line=dict(width=6),
+                name="Building",
+                hoverinfo="skip",
+                showlegend=False,
+            )
+        )
 
-rng_local = np.random.default_rng(int(seed))
-road_mask = place_roads(elev, curvy, spurs, rng_local)
 
-# Buildings cluster near roads & gentle slopes
-slope_mag = np.hypot(*np.gradient(elev))
-gentle = (slope_mag < np.percentile(slope_mag, 60))
+def scs_runoff_depth(P_mm: float, CN: float) -> float:
+    """
+    SCS-CN runoff (mm). P rainfall, CN 30..100.
+    Q = (P - Ia)^2 / (P - Ia + S), where S = 25400/CN - 254 (mm), Ia ~ 0.2S.
+    """
+    S = 25400.0 / np.clip(CN, 1, 100) - 254.0
+    Ia = 0.2 * S
+    if P_mm <= Ia:
+        return 0.0
+    return ((P_mm - Ia) ** 2) / (P_mm - Ia + S)
 
-# --- FIXED: grow road neighborhood safely (no logical_and.reduce with scalars) ---
-near = np.zeros_like(road_mask, dtype=bool)
-near[:-1, :] |= road_mask[1:, :]
-near[1:,  :] |= road_mask[:-1, :]
-near[:, :-1] |= road_mask[:, 1:]
-near[:, 1:]  |= road_mask[:, :-1]
-near_road = road_mask | near
 
-# --- settlement_score with robust normalization (no .ptp) ---
-settlement_score = gentle.astype(float) * 0.6 + near_road.astype(float) * 1.2
-settlement_noise = 0.3 * fbm_noise(H, W, octaves=2, persistence=0.7, rng=rng_local)
-settlement_score = settlement_score + settlement_noise
-settlement_score = np.array(settlement_score, dtype=np.float64, copy=False)
-settlement_min = float(np.nanmin(settlement_score))
-settlement_ptp = float(np.nanmax(settlement_score) - settlement_min)
-if settlement_ptp == 0:
-    settlement_ptp = 1e-9
-settlement_score = (settlement_score - settlement_min) / settlement_ptp
+# ---------- UI ----------
+st.set_page_config(page_title="Kigali Mini-World (3D)", layout="wide")
+st.title("🌍 Interactive 3D Mini-World (Kigali-inspired)")
 
-target_build = int(W*H*build_share)
-buildings = np.zeros((H, W), dtype=bool)
-idx = np.dstack(np.unravel_index(np.argsort(settlement_score.ravel())[::-1], (H, W)))[0]
-for r, c in idx:
-    if target_build <= 0:
-        break
-    rr = slice(max(0, r-1), min(H, r+2))
-    cc = slice(max(0, c-1), min(W, c+2))
-    add = (~buildings[rr, cc]) & (settlement_score[rr, cc] > 0.55)
-    if add.any():
-        buildings[rr, cc] = True
-        target_build -= int(add.sum())
+left, right = st.columns([0.62, 0.38], gap="large")
 
-# Forest prefers mid/high elevation & non-steep, away from roads/buildings
-forest_score = (elev - elev.min()) / (elev.ptp() + 1e-9)
-forest_score *= (1.0 - np.clip(slope_mag / (slope_mag.max() + 1e-9), 0, 1)) ** 0.4
-forest_score *= (1.0 - buildings.astype(float))
-forest_score *= (1.0 - road_mask.astype(float)*0.9)
-forest_score += 0.25 * fbm_noise(H, W, octaves=2, persistence=0.6, rng=rng_local)
-forest_score = (forest_score - forest_score.min()) / (forest_score.ptp() + 1e-9)
+with right:
+    st.subheader("World & Environment")
+    seed = st.slider("Random seed", 0, 9999, 2025, 1)
+    size_m = st.slider("World size (m)", 150, 500, 320, 10)
+    n = st.slider("Grid resolution", 60, 160, 120, 10)
+    hilliness = st.slider("Hilliness scale", 6, 30, 16)
+    road_depth = st.slider("Road/valley depth (m)", 0.0, 3.0, 1.2, 0.1)
+    show_boundary = st.checkbox("Show parcel boundary", True)
+    show_buildings = st.checkbox("Show small buildings", True)
 
-target_forest = int(W*H*forest_share)
-forest = np.zeros((H, W), dtype=bool)
-idx2 = np.dstack(np.unravel_index(np.argsort(forest_score.ravel())[::-1], (H, W)))[0]
-count = 0
-for r, c in idx2:
-    if count >= target_forest:
-        break
-    if not buildings[r, c] and not road_mask[r, c]:
-        forest[r, c] = True
-        count += 1
+    st.subheader("Hügelkultur (optional)")
+    use_hugel = st.checkbox("Add hügelkultur mounds", False)
+    mound_cover = st.slider("Mound coverage (%)", 0, 50, 20, 1)
+    mound_height = st.slider("Initial mound height (m)", 0.0, 1.5, 0.6, 0.1)
+    years = st.slider("Years (settling/decomposition)", 0, 12, 3, 1)
+    # Simple aging curve: height decays to ~40% by year 10
+    aging_factor = float(np.exp(-years / 10.0) * 0.6 + 0.4)
 
-# Ground = remainder
-ground = ~(forest | buildings | road_mask)
+    st.subheader("Rain & Runoff (SCS-CN)")
+    P = st.slider("Storm rainfall (mm)", 10, 1400, 120, 10)
+    CN = st.slider("Curve Number (higher = more runoff)", 55, 95, 80)
 
-# Land cover map (0=forest, 1=ground, 2=build/road)
-world = np.full((H, W), 1, dtype=np.int8)
-world[forest] = 0
-world[buildings | road_mask] = 2
+# ---------- Terrain ----------
+X, Y = make_grid(n, size_m)
+Z0 = smooth_rand(n, k=hilliness, seed=seed)  # 0..1
+# Scale to meters (relief ~ 10 m)
+Z = 2 + 8 * Z0
 
-# -------------------- SCS-CN runoff --------------------
-CN_base = {  # AMC II baseline
-    0: 60,  # forest
-    1: 78,  # mixed ground
-    2: 95,  # impervious (roads/roofs)
-}
-moisture_adj = {"Dry": -5, "Average": 0, "Wet": +5}
+# Add a few gentle hills/valleys so it feels 'Rwandan hills'
+add_gaussian_bump(Z, 0.25, 0.65, +2.3, 0.12)
+add_gaussian_bump(Z, 0.75, 0.55, +1.8, 0.16)
+add_gaussian_bump(Z, 0.50, 0.30, -1.4, 0.18)
 
-CN = np.zeros_like(world, dtype=float)
-for k, v in CN_base.items():
-    CN[world == k] = v + moisture_adj[soil_state]
-CN = np.clip(CN, 30, 98)
-S = 25400.0 / CN - 254.0   # mm
-Ia = 0.2 * S
+# Carve a curvy dirt road / drainage swale roughly north-south
+road = [(0.18, 0.80), (0.35, 0.60), (0.48, 0.48), (0.52, 0.38), (0.50, 0.22)]
+if road_depth > 0:
+    carve_polyline_trench(Z, road, depth=road_depth, width=0.02)
 
-def scs_runoff(P, S, Ia):
-    ex = P - Ia
-    return np.where(ex > 0, (ex**2) / (ex + S), 0.0)
+# Optional hügelkultur mounds dotted inside boundary area
+if use_hugel and mound_height > 0 and mound_cover > 0:
+    rng = np.random.default_rng(seed + 99)
+    num = int(12 + mound_cover * 0.6)
+    for _ in range(num):
+        cx, cy = rng.uniform(0.22, 0.85), rng.uniform(0.22, 0.78)
+        h = mound_height * (0.6 + 0.4 * rng.random()) * aging_factor
+        s = rng.uniform(0.012, 0.028)
+        add_gaussian_bump(Z, cx, cy, +h, s)
 
-# -------------------- Simple D8 routing --------------------
-def route_d8(Q_mm, elev, iters=1):
-    H, W = Q_mm.shape
-    acc = Q_mm.copy()
-    for _ in range(iters):
-        moved = np.zeros_like(acc)
-        for r in range(H):
-            for c in range(W):
-                z0 = elev[r, c]
-                rmin, cmin, zmin = r, c, z0
-                for dr in (-1, 0, 1):
-                    for dc in (-1, 0, 1):
-                        rr = r + dr; cc = c + dc
-                        if 0 <= rr < H and 0 <= cc < W:
-                            z = elev[rr, cc]
-                            if z < zmin:
-                                zmin = z; rmin = rr; cmin = cc
-                if (rmin, cmin) != (r, c):
-                    moved[rmin, cmin] += acc[r, c] * 0.88  # 88% flows
-                    acc[r, c] *= 0.12                      # 12% ponds/roughness
-        acc += moved
-    return acc
+# ---------- 3D Figure ----------
+fig = go.Figure()
 
-# -------------------- 3D figure builder --------------------
-def cover_colorscale():
-    # Discrete mapping: 0=forest (green), 1=ground (tan), 2=road/build (dark gray)
-    return [
-        [0.00, "rgb(32,128,32)"],   [0.33, "rgb(32,128,32)"],   # forest
-        [0.33, "rgb(194,176,138)"], [0.66, "rgb(194,176,138)"], # ground
-        [0.66, "rgb(45,45,48)"],    [1.00, "rgb(45,45,48)"],    # roads/buildings
-    ]
-
-def make_3d_figure(elev, world, pond_mm=None, title=""):
-    H, W = elev.shape
-    z_base = elev.copy()
-    cover_idx = world.astype(float) / 2.0  # 0, 0.5, 1.0
-    x = np.arange(W); y = np.arange(H)
-
-    fig = go.Figure()
-
-    # Base surface (terrain + cover colors)
-    fig.add_trace(go.Surface(
-        x=x, y=y, z=z_base,
-        surfacecolor=cover_idx,
-        colorscale=cover_colorscale(),
-        cmin=0.0, cmax=1.0,
+fig.add_trace(
+    go.Surface(
+        x=X,
+        y=Y,
+        z=Z,
+        colorscale="Earth",
         showscale=False,
-        lighting=dict(ambient=0.4, diffuse=0.7, specular=0.2, roughness=0.8),
-        lightposition=dict(x=200, y=100, z=300),
-        name="Terrain"
-    ))
-
-    # Water overlay (semi-transparent)
-    if pond_mm is not None:
-        pond_norm = pond_mm / (np.percentile(pond_mm, 98) + 1e-9)
-        z_water = z_base + 0.02 * relief + 0.20 * pond_norm * (relief / 1.0)
-        z_water = np.where(pond_mm > 1e-6, z_water, np.nan)
-        fig.add_trace(go.Surface(
-            x=x, y=y, z=z_water,
-            colorscale=[[0, "rgb(70,120,255)"], [1, "rgb(70,120,255)"]],
-            showscale=False,
-            opacity=0.55,
-            name="Water"
-        ))
-
-    fig.update_layout(
-        title=title,
-        scene=dict(
-            xaxis=dict(visible=False),
-            yaxis=dict(visible=False),
-            zaxis=dict(visible=False),
-            aspectmode="data"
-        ),
-        margin=dict(l=0, r=0, t=40, b=0),
-        height=720
+        lighting=dict(ambient=0.4, diffuse=0.6, fresnel=0.1, specular=0.2, roughness=0.8),
+        lightposition=dict(x=3000, y=2000, z=8000),
+        hovertemplate="x:%{x:.1f} m<br>y:%{y:.1f} m<br>z:%{z:.2f} m<extra></extra>",
+        name="Terrain",
+        opacity=0.98,
     )
-    return fig
+)
 
-# -------------------- UI: actions --------------------
-colA, colB = st.columns([2.2, 1.0])
-with colB:
-    st.markdown("### Actions")
-    run_once = st.button("Simulate full storm")
-    animate = st.button("Animate rainfall")
-
-with colA:
-    if run_once:
-        inc = storm_mm
-        Q = scs_runoff(inc, S, Ia)       # per-cell runoff (mm)
-        routed = route_d8(Q, elev, iters=3)
-        pond = routed
-        infil = np.clip(inc - Q, 0, None)
-
-        fig = make_3d_figure(elev, world, pond_mm=pond,
-                             title=f"Full storm: {storm_mm} mm (soil={soil_state})")
-        st.plotly_chart(fig, use_container_width=True)
-        st.info(f"Mean infiltration: {infil.mean():.1f} mm | "
-                f"Mean runoff: {Q.mean():.1f} mm | "
-                f"Max ponded: {pond.max():.1f} mm")
-
-    elif animate:
-        placeholder = st.empty()
-        progress = st.progress(0)
-        series = np.linspace(0, storm_mm, num=max(1, steps))
-        prev = 0.0
-        pond = np.zeros_like(elev)
-
-        for i, total in enumerate(series, start=1):
-            inc = total - prev
-            prev = total
-            Q = scs_runoff(inc, S, Ia)
-            routed = route_d8(Q, elev, iters=1)
-            pond += routed
-
-            fig = make_3d_figure(elev, world, pond_mm=pond,
-                                 title=f"Step {i}/{len(series)} – accumulated ponding")
-            placeholder.plotly_chart(fig, use_container_width=True)
-            progress.progress(int(100 * i / len(series)))
-            time.sleep(frame_delay)
-
-        st.success(f"Done. Mean runoff this storm: {pond.mean():.1f} mm (map shows where it concentrates).")
-
-    else:
-        fig = make_3d_figure(elev, world, pond_mm=None, title="Terrain & land cover (no storm yet)")
-        st.plotly_chart(fig, use_container_width=True)
-        st.caption("Tip: increase **forest share** or reduce **buildings/roads** to see more infiltration and less concentration in valleys/roads.")
-
-# -------------------- Diagnostics --------------------
-with st.expander("Diagnostics & assumptions"):
-    pct_forest = (world==0).mean()*100
-    pct_ground = (world==1).mean()*100
-    pct_build  = (world==2).mean()*100
-    st.write(f"Land cover: forest {pct_forest:.1f}%, ground {pct_ground:.1f}%, buildings/roads {pct_build:.1f}%")
-    st.write(f"CN stats (min/mean/max): {CN.min():.0f} / {CN.mean():.0f} / {CN.max():.0f}")
-    st.markdown(
-        """
-**Notes**
-- 3D surface is synthetic but terrain-informed; hill direction and valleys are realistic.
-- Curve Numbers: forest < ground < roads/buildings for infiltration capacity.
-- Routing is a simplified D8 flow; use results for intuition and scenario comparison.
-        """
+# Boundary polyline
+bx, by = polygon_boundary_xy(size_m)
+if show_boundary:
+    fig.add_trace(
+        go.Scatter3d(
+            x=bx, y=by, z=np.full_like(bx, Z.mean() + 0.2),
+            mode="lines",
+            line=dict(width=6),
+            name="Boundary",
+            hoverinfo="skip",
+            showlegend=False,
+        )
     )
+
+# Road line on top for visibility
+rx = np.array([p[0] for p in road]) * size_m
+ry = np.array([p[1] for p in road]) * size_m
+rz = np.interp(rx, X[0], Z[int(0.5 * n)])  # rough overlay height
+fig.add_trace(
+    go.Scatter3d(
+        x=rx, y=ry, z=rz + 0.15,
+        mode="lines",
+        line=dict(width=8),
+        name="Road / Swale",
+        hoverinfo="skip",
+        showlegend=False,
+    )
+)
+
+# Simple 'buildings'
+if show_buildings:
+    add_building_blocks(fig, size_m=size_m, ground_h=float(np.percentile(Z, 30)))
+
+fig.update_scenes(
+    xaxis_title="East (m)", yaxis_title="North (m)", zaxis_title="Elevation (m)",
+    aspectmode="data",
+)
+
+fig.update_layout(
+    margin=dict(l=0, r=0, t=0, b=0),
+    scene_camera=dict(
+        eye=dict(x=1.8, y=1.6, z=1.2),
+        up=dict(x=0, y=0, z=1),
+    ),
+)
+
+with left:
+    st.plotly_chart(fig, use_container_width=True)
+
+# ---------- Metrics ----------
+# Quick runoff calc and volumes
+Q_mm = scs_runoff_depth(P, CN)
+A_m2 = size_m * size_m
+runoff_m3 = Q_mm / 1000.0 * A_m2
+rain_m3 = P / 1000.0 * A_m2
+retained_m3 = max(rain_m3 - runoff_m3, 0.0)
+
+m1, m2, m3 = st.columns(3)
+m1.metric("Rain volume", f"{rain_m3:,.0f} m³", f"{P} mm")
+m2.metric("Runoff (SCS-CN)", f"{runoff_m3:,.0f} m³", f"CN {CN}")
+m3.metric("Retained/Infiltrated", f"{retained_m3:,.0f} m³",
+          ("Hügel on" if use_hugel else "Hügel off"))
+
+st.caption(
+    "Tip: Reduce **CN** (more permeable soil/cover) and/or raise mound coverage to see retention increase. "
+    "Use the **Years** slider to visualize how aging/settling lowers mound height over time."
+)
 
