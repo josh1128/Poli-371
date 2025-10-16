@@ -1,277 +1,178 @@
 # app.py
 # ------------------------------------------------------------
-# Interactive 3D Mini-World (Streamlit + Plotly)
-# - Procedural terrain (no external data)
-# - Kigali-like parcel boundary, road, simple buildings
-# - Optional hügelkultur mounds with aging/settling
-# - Rainfall + SCS-CN runoff quick calc
+# Kigali 3D Mini-World (Streamlit + PyDeck, no API keys needed)
+# - Real elevation via AWS Terrarium tiles
+# - Satellite texture (Carto) draped on terrain
+# - Parcel boundary, a dirt road, tiny "buildings", optional mounds
+# - Interactive camera + layer controls
 # ------------------------------------------------------------
 import math
-from typing import Tuple
-
 import numpy as np
-import plotly.graph_objects as go
 import streamlit as st
+import pydeck as pdk
 
 
-# ---------- Helpers ----------
-def make_grid(n: int, size_m: float) -> Tuple[np.ndarray, np.ndarray]:
-    """Return X, Y coordinate grids from 0..size_m."""
-    xs = np.linspace(0, size_m, n)
-    ys = np.linspace(0, size_m, n)
-    X, Y = np.meshgrid(xs, ys)
-    return X, Y
+st.set_page_config(page_title="Kigali 3D Mini-World", layout="wide")
+st.title("🌍 Kigali 3D Mini-World (HOPE Rwanda area)")
 
+# --- Site location (approx; Rwabutenge, Gahanga Sector, Kicukiro) ---
+SITE_LAT, SITE_LON = -2.0120, 30.1400
 
-def smooth_rand(n: int, k: float, seed: int) -> np.ndarray:
-    """
-    Fast 'soft' noise without extra deps: sum of a few sin/cos bases
-    plus seeded randomness, then gentle blur via rolling mean.
-    k controls hilliness scale (bigger = broader hills).
-    """
-    rng = np.random.default_rng(seed)
-    x = np.linspace(0, 2 * np.pi, n)
-    y = np.linspace(0, 2 * np.pi, n)
-    X, Y = np.meshgrid(x, y)
+# --- SIDEBAR CONTROLS ---
+st.sidebar.header("Camera")
+zoom = st.sidebar.slider("Zoom", 10.0, 17.5, 15.0, 0.1)
+pitch = st.sidebar.slider("Pitch", 0, 75, 60, 1)
+bearing = st.sidebar.slider("Bearing", -180, 180, 30, 1)
 
-    # A few smooth basis fields
-    Z = (
-        0.45 * np.sin(X / k + 0.7) * np.cos(Y / k + 1.3)
-        + 0.35 * np.cos(1.7 * X / k) * np.sin(1.2 * Y / k)
-        + 0.20 * np.sin(0.7 * X / k + 0.9) * np.sin(0.6 * Y / k + 0.4)
-    )
+st.sidebar.header("Layers")
+show_boundary = st.sidebar.checkbox("Parcel boundary", True)
+show_road = st.sidebar.checkbox("Dirt road", True)
+show_buildings = st.sidebar.checkbox("Small buildings", True)
+use_hugel = st.sidebar.checkbox("Hügelkultur mounds", False)
 
-    # Add a gentle random field and roll-mean blur
-    R = rng.normal(0, 0.2, size=(n, n))
-    R = (np.roll(R, 1, 0) + R + np.roll(R, -1, 0) + np.roll(R, 1, 1) + np.roll(R, -1, 1)) / 5.0
-    Z = Z + 0.25 * R
-    # Normalize 0..1
-    Z = (Z - Z.min()) / (Z.max() - Z.min() + 1e-9)
-    return Z
+if use_hugel:
+    mound_count = st.sidebar.slider("Mounds count", 4, 60, 20, 1)
+    mound_radius_m = st.sidebar.slider("Mound radius (m)", 2, 12, 6, 1)
+    years = st.sidebar.slider("Years (settling)", 0, 12, 3, 1)
+else:
+    mound_count, mound_radius_m, years = 0, 0, 0
 
-
-def add_gaussian_bump(Z: np.ndarray, cx: float, cy: float, amp: float, sigma: float) -> None:
-    """Add a smooth hill (+) or trench (−) at center (cx, cy) in grid coords."""
-    n = Z.shape[0]
-    xs = np.linspace(0, 1, n)
-    ys = np.linspace(0, 1, n)
-    X, Y = np.meshgrid(xs, ys)
-    Z += amp * np.exp(-(((X - cx) ** 2 + (Y - cy) ** 2) / (2 * sigma**2)))
-
-
-def carve_polyline_trench(Z: np.ndarray, pts01: list, depth: float, width: float) -> None:
-    """Lower elevation along a polyline (simple road/valley)."""
-    n = Z.shape[0]
-    xs = np.linspace(0, 1, n)
-    ys = np.linspace(0, 1, n)
-    X, Y = np.meshgrid(xs, ys)
-
-    for (x0, y0), (x1, y1) in zip(pts01[:-1], pts01[1:]):
-        # distance from each cell to the segment
-        vx, vy = x1 - x0, y1 - y0
-        wx, wy = X - x0, Y - y0
-        c1 = vx * wx + vy * wy
-        c2 = vx * vx + vy * vy + 1e-12
-        t = np.clip(c1 / c2, 0, 1)
-        projx = x0 + t * vx
-        projy = y0 + t * vy
-        d = np.sqrt((X - projx) ** 2 + (Y - projy) ** 2)
-        Z -= depth * np.exp(-((d**2) / (2 * width**2)))
-
-
-def polygon_boundary_xy(size_m: float) -> Tuple[np.ndarray, np.ndarray]:
-    """
-    Rough polygon inspired by the screenshot (world coordinates in meters).
-    Returns closed loop.
-    """
-    # Coordinates in 0..1 then scale to meters
-    poly01 = np.array([
-        [0.15, 0.15],
-        [0.18, 0.80],
-        [0.55, 0.85],
-        [0.88, 0.80],
-        [0.90, 0.35],
-        [0.80, 0.20],
-        [0.65, 0.25],
-        [0.50, 0.18],
-        [0.35, 0.22],
-        [0.20, 0.18],
-        [0.15, 0.15],
-    ])
-    return poly01[:, 0] * size_m, poly01[:, 1] * size_m
-
-
-def add_building_blocks(fig, size_m: float, ground_h: float):
-    """Simple extruded 'buildings' as short prisms near the south edge."""
-    bx = np.array([0.30, 0.33, 0.33, 0.30, 0.30]) * size_m
-    by = np.array([0.18, 0.18, 0.22, 0.22, 0.18]) * size_m
-    cx = np.array([0.55, 0.58, 0.58, 0.55, 0.55]) * size_m
-    cy = np.array([0.17, 0.17, 0.21, 0.21, 0.17]) * size_m
-
-    for xs, ys in [(bx, by), (cx, cy)]:
-        fig.add_trace(
-            go.Scatter3d(
-                x=xs,
-                y=ys,
-                z=[ground_h, ground_h, ground_h + 3, ground_h + 3, ground_h],
-                mode="lines",
-                line=dict(width=6),
-                name="Building",
-                hoverinfo="skip",
-                showlegend=False,
-            )
-        )
-
-
-def scs_runoff_depth(P_mm: float, CN: float) -> float:
-    """
-    SCS-CN runoff (mm). P rainfall, CN 30..100.
-    Q = (P - Ia)^2 / (P - Ia + S), where S = 25400/CN - 254 (mm), Ia ~ 0.2S.
-    """
-    S = 25400.0 / np.clip(CN, 1, 100) - 254.0
-    Ia = 0.2 * S
-    if P_mm <= Ia:
-        return 0.0
-    return ((P_mm - Ia) ** 2) / (P_mm - Ia + S)
-
-
-# ---------- UI ----------
-st.set_page_config(page_title="Kigali Mini-World (3D)", layout="wide")
-st.title("🌍 Interactive 3D Mini-World (Kigali-inspired)")
-
-left, right = st.columns([0.62, 0.38], gap="large")
-
-with right:
-    st.subheader("World & Environment")
-    seed = st.slider("Random seed", 0, 9999, 2025, 1)
-    size_m = st.slider("World size (m)", 150, 500, 320, 10)
-    n = st.slider("Grid resolution", 60, 160, 120, 10)
-    hilliness = st.slider("Hilliness scale", 6, 30, 16)
-    road_depth = st.slider("Road/valley depth (m)", 0.0, 3.0, 1.2, 0.1)
-    show_boundary = st.checkbox("Show parcel boundary", True)
-    show_buildings = st.checkbox("Show small buildings", True)
-
-    st.subheader("Hügelkultur (optional)")
-    use_hugel = st.checkbox("Add hügelkultur mounds", False)
-    mound_cover = st.slider("Mound coverage (%)", 0, 50, 20, 1)
-    mound_height = st.slider("Initial mound height (m)", 0.0, 1.5, 0.6, 0.1)
-    years = st.slider("Years (settling/decomposition)", 0, 12, 3, 1)
-    # Simple aging curve: height decays to ~40% by year 10
-    aging_factor = float(np.exp(-years / 10.0) * 0.6 + 0.4)
-
-    st.subheader("Rain & Runoff (SCS-CN)")
-    P = st.slider("Storm rainfall (mm)", 10, 1400, 120, 10)
-    CN = st.slider("Curve Number (higher = more runoff)", 55, 95, 80)
-
-# ---------- Terrain ----------
-X, Y = make_grid(n, size_m)
-Z0 = smooth_rand(n, k=hilliness, seed=seed)  # 0..1
-# Scale to meters (relief ~ 10 m)
-Z = 2 + 8 * Z0
-
-# Add a few gentle hills/valleys so it feels 'Rwandan hills'
-add_gaussian_bump(Z, 0.25, 0.65, +2.3, 0.12)
-add_gaussian_bump(Z, 0.75, 0.55, +1.8, 0.16)
-add_gaussian_bump(Z, 0.50, 0.30, -1.4, 0.18)
-
-# Carve a curvy dirt road / drainage swale roughly north-south
-road = [(0.18, 0.80), (0.35, 0.60), (0.48, 0.48), (0.52, 0.38), (0.50, 0.22)]
-if road_depth > 0:
-    carve_polyline_trench(Z, road, depth=road_depth, width=0.02)
-
-# Optional hügelkultur mounds dotted inside boundary area
-if use_hugel and mound_height > 0 and mound_cover > 0:
-    rng = np.random.default_rng(seed + 99)
-    num = int(12 + mound_cover * 0.6)
-    for _ in range(num):
-        cx, cy = rng.uniform(0.22, 0.85), rng.uniform(0.22, 0.78)
-        h = mound_height * (0.6 + 0.4 * rng.random()) * aging_factor
-        s = rng.uniform(0.012, 0.028)
-        add_gaussian_bump(Z, cx, cy, +h, s)
-
-# ---------- 3D Figure ----------
-fig = go.Figure()
-
-fig.add_trace(
-    go.Surface(
-        x=X,
-        y=Y,
-        z=Z,
-        colorscale="Earth",
-        showscale=False,
-        lighting=dict(ambient=0.4, diffuse=0.6, fresnel=0.1, specular=0.2, roughness=0.8),
-        lightposition=dict(x=3000, y=2000, z=8000),
-        hovertemplate="x:%{x:.1f} m<br>y:%{y:.1f} m<br>z:%{z:.2f} m<extra></extra>",
-        name="Terrain",
-        opacity=0.98,
-    )
+# --- INITIAL VIEW ---
+view = pdk.ViewState(
+    latitude=SITE_LAT,
+    longitude=SITE_LON,
+    zoom=zoom,
+    pitch=pitch,
+    bearing=bearing,
 )
 
-# Boundary polyline
-bx, by = polygon_boundary_xy(size_m)
+# --- BASE TERRAIN (no API keys required) ---
+# Uses satellite texture + Terrarium elevation tiles
+terrain = pdk.Layer(
+    "TerrainLayer",
+    data=None,
+    elevation_decoder={"rScaler": 256.0, "gScaler": 1.0, "bScaler": 1.0/256.0, "offset": -32768.0},
+    texture="https://basemaps.cartocdn.com/rastertiles/satellite/{z}/{x}/{y}.png",
+    elevation_data="https://s3.amazonaws.com/elevation-tiles-prod/terrarium/{z}/{x}/{y}.png",
+    wireframe=False,
+    max_zoom=18,
+    opacity=1.0,
+)
+
+layers = [terrain]
+
+# --- HELPER: quick offsets in meters to lat/lon ---
+def offset_meters(lat, lon, dx_m, dy_m):
+    # dx east-west, dy north-south
+    dlat = (dy_m / 111_320.0)
+    dlon = (dx_m / (111_320.0 * math.cos(math.radians(lat))))
+    return lat + dlat, lon + dlon
+
+# --- PARCEL BOUNDARY (rough polygon inspired by screenshot) ---
+# Define polygon by offsets (meters) relative to site center
+poly_offsets = [
+    (-800, -800), (-700, +800), (+100, +900), (+900, +800),
+    (+950, -200), (+700, -600), (+300, -500), (0, -700),
+    (-300, -580), (-650, -650), (-800, -800)
+]
+boundary_coords = []
+for dx, dy in poly_offsets:
+    lat, lon = offset_meters(SITE_LAT, SITE_LON, dx, dy)
+    boundary_coords.append([lon, lat])
+
 if show_boundary:
-    fig.add_trace(
-        go.Scatter3d(
-            x=bx, y=by, z=np.full_like(bx, Z.mean() + 0.2),
-            mode="lines",
-            line=dict(width=6),
-            name="Boundary",
-            hoverinfo="skip",
-            showlegend=False,
-        )
+    boundary = pdk.Layer(
+        "PolygonLayer",
+        data=[{"polygon": boundary_coords, "name": "Site"}],
+        get_polygon="polygon",
+        get_fill_color=[255, 140, 0, 40],
+        get_line_color=[255, 140, 0, 220],
+        line_width_min_pixels=2,
+        stroked=True,
+        filled=True,
+        extruded=False,
+        pickable=False,
     )
+    layers.append(boundary)
 
-# Road line on top for visibility
-rx = np.array([p[0] for p in road]) * size_m
-ry = np.array([p[1] for p in road]) * size_m
-rz = np.interp(rx, X[0], Z[int(0.5 * n)])  # rough overlay height
-fig.add_trace(
-    go.Scatter3d(
-        x=rx, y=ry, z=rz + 0.15,
-        mode="lines",
-        line=dict(width=8),
-        name="Road / Swale",
-        hoverinfo="skip",
-        showlegend=False,
+# --- DIRT ROAD (simple polyline) ---
+if show_road:
+    road_offsets = [(-700, +700), (-300, +300), (-60, +80), (+40, -200), (0, -500)]
+    road_coords = []
+    for dx, dy in road_offsets:
+        lat, lon = offset_meters(SITE_LAT, SITE_LON, dx, dy)
+        road_coords.append([lon, lat])
+
+    road = pdk.Layer(
+        "PathLayer",
+        data=[{"path": road_coords}],
+        get_path="path",
+        get_color=[180, 120, 60],
+        width_scale=1,
+        width_min_pixels=4,
+        get_width=5,
+        pickable=False,
     )
-)
+    layers.append(road)
 
-# Simple 'buildings'
+# --- SMALL "BUILDINGS" as low columns near south edge ---
 if show_buildings:
-    add_building_blocks(fig, size_m=size_m, ground_h=float(np.percentile(Z, 30)))
+    b_offsets = [(-300, -650), (+50, -700), (+380, -720)]
+    b_data = []
+    for dx, dy in b_offsets:
+        lat, lon = offset_meters(SITE_LAT, SITE_LON, dx, dy)
+        b_data.append({"pos": [lon, lat], "height": 3.5, "radius": 8})
+    buildings = pdk.Layer(
+        "ColumnLayer",
+        data=b_data,
+        get_position="pos",
+        get_elevation="height",
+        elevation_scale=1,
+        radius_units="meters",
+        get_radius="radius",
+        get_fill_color=[240, 240, 240, 200],
+        pickable=False,
+        extruded=True,
+    )
+    layers.append(buildings)
 
-fig.update_scenes(
-    xaxis_title="East (m)", yaxis_title="North (m)", zaxis_title="Elevation (m)",
-    aspectmode="data",
+# --- HÜGELKULTUR MOUNDS (small cylinders) ---
+if use_hugel and mound_count > 0:
+    rng = np.random.default_rng(2025)
+    # aging: mound height decays toward ~40% by year 10
+    aging = float(np.exp(-years / 10.0) * 0.6 + 0.4)
+    m_data = []
+    for _ in range(mound_count):
+        dx = rng.uniform(-200, +700)
+        dy = rng.uniform(-200, +500)
+        lat, lon = offset_meters(SITE_LAT, SITE_LON, dx, dy)
+        height = rng.uniform(0.5, 1.2) * aging
+        m_data.append({"pos": [lon, lat], "height": height, "radius": mound_radius_m})
+    mounds = pdk.Layer(
+        "ColumnLayer",
+        data=m_data,
+        get_position="pos",
+        get_elevation="height",
+        elevation_scale=1,
+        radius_units="meters",
+        get_radius="radius",
+        get_fill_color=[34, 139, 34, 180],
+        pickable=False,
+        extruded=True,
+    )
+    layers.append(mounds)
+
+# --- RENDER ---
+deck = pdk.Deck(
+    layers=layers,
+    initial_view_state=view,
+    map_provider="carto",          # no token needed
+    map_style="satellite",
+    tooltip={"text": "Kigali 3D mini-world"},
 )
-
-fig.update_layout(
-    margin=dict(l=0, r=0, t=0, b=0),
-    scene_camera=dict(
-        eye=dict(x=1.8, y=1.6, z=1.2),
-        up=dict(x=0, y=0, z=1),
-    ),
-)
-
-with left:
-    st.plotly_chart(fig, use_container_width=True)
-
-# ---------- Metrics ----------
-# Quick runoff calc and volumes
-Q_mm = scs_runoff_depth(P, CN)
-A_m2 = size_m * size_m
-runoff_m3 = Q_mm / 1000.0 * A_m2
-rain_m3 = P / 1000.0 * A_m2
-retained_m3 = max(rain_m3 - runoff_m3, 0.0)
-
-m1, m2, m3 = st.columns(3)
-m1.metric("Rain volume", f"{rain_m3:,.0f} m³", f"{P} mm")
-m2.metric("Runoff (SCS-CN)", f"{runoff_m3:,.0f} m³", f"CN {CN}")
-m3.metric("Retained/Infiltrated", f"{retained_m3:,.0f} m³",
-          ("Hügel on" if use_hugel else "Hügel off"))
+st.pydeck_chart(deck, use_container_width=True)
 
 st.caption(
-    "Tip: Reduce **CN** (more permeable soil/cover) and/or raise mound coverage to see retention increase. "
-    "Use the **Years** slider to visualize how aging/settling lowers mound height over time."
+    "Notes: Terrain uses AWS Terrarium elevation tiles + Carto satellite imagery. "
+    "Adjust Zoom/Pitch/Bearing for different angles. Boundary/road are illustrative."
 )
-
