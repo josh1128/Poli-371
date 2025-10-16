@@ -6,4 +6,3 @@ streamlit-folium>=0.20.0
 plotly>=5.22
 pydeck
 leafmap
-math
