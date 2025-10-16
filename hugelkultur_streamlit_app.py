@@ -1,261 +1,247 @@
-# hugelkultur_map_impact_free.py
-# Hügelkultur impact simulation – HOPE Rwanda (Rwabutenge, Gahanga, Kicukiro)
-# - Rain slider up to 1,400 mm
-# - Wood decomposition reduces effective storage over time
-# - NEW: Visible mound "sinking" over years due to shrinkage/settling (separate height settling rate)
-# - Displays note: "Hugelbeds sink in size after several years..." [2]
+# app.py
+# LIVE Permeable Pavement + Vetiver Grass Simulator (Streamlit, no Matplotlib)
+# Deps: streamlit, numpy, pandas (built-in charts only)
 
-import math, time
+import time
 import numpy as np
+import pandas as pd
 import streamlit as st
-import matplotlib.pyplot as plt
-import folium
-from streamlit_folium import st_folium
 
-# -------------------- Page setup --------------------
-st.set_page_config(page_title="Hügelkultur Impact – HOPE Rwanda", layout="wide")
-st.title("💧 Hügelkultur Impact Simulation – HOPE Rwanda Site (Rwabutenge, Gahanga, Kicukiro)")
+st.set_page_config(page_title="Live Pavement + Vetiver Simulator", layout="wide")
+st.title("🛣️ Permeable Pavement + 🌿 Vetiver — LIVE Runoff Simulator")
 
-# -------------------- Free Map (OpenStreetMap) --------------------
-SITE_LAT, SITE_LON = -2.0344, 30.1318
-with st.expander("🗺️ View Project Site Map", expanded=True):
-    m = folium.Map(location=[SITE_LAT, SITE_LON], zoom_start=14, tiles="OpenStreetMap")
-    folium.Marker(
-        [SITE_LAT, SITE_LON],
-        popup="HOPE Rwanda Project Site – Rwabutenge, Gahanga Sector",
-        tooltip="Click for details",
-        icon=folium.Icon(color="red", icon="tint")
-    ).add_to(m)
-    folium.LayerControl().add_to(m)
-    st_folium(m, width=700, height=450)
-
-st.markdown(
-    """
-    This tool simulates a **rainfall event** and compares **runoff** with and without a Hügelkultur mound.
-    The mound stores rainwater like a sponge, reducing surface runoff and erosion.
-    """
-)
-
-# -------------------- Sidebar Controls ----------------------
-st.sidebar.header("🌧️ Storm Parameters")
-
-# Rwanda monthly rainfall guide (mm): dry Jun–Aug; rainy Mar–May & Sep–Nov
-monthly_mm = {
-    "Jan": 100, "Feb": 110, "Mar": 120, "Apr": 150, "May": 150,
-    "Jun": 20,  "Jul": 15,  "Aug": 30,
-    "Sep": 110, "Oct": 120, "Nov": 130, "Dec": 100
-}
-
-rain_input_mode = st.sidebar.radio(
-    "Rain input",
-    ["Manual", "Rwanda seasonal preset"],
-    index=1,
-    help="Use Rwanda presets to reflect dry (Jun–Aug) vs rainy seasons (Mar–May, Sep–Nov)."
-)
-
-if rain_input_mode == "Manual":
-    total_rain_mm = st.sidebar.slider("Total storm rain (mm)", 5, 1400, 120, 5)
-else:
-    month = st.sidebar.selectbox("Month (Rwanda climate)", list(monthly_mm.keys()), index=3)
-    monthly_total = monthly_mm[month]
-    storm_pct = st.sidebar.select_slider(
-        "Storm size (% of monthly total)",
-        options=[5, 10, 15, 20, 25, 30, 40, 50],
-        value=10,
-        help="Downpours are common; larger values approximate intense events."
-    )
-    suggested = int(round(monthly_total * storm_pct / 100.0))
-    total_rain_mm = st.sidebar.slider(
-        "Total storm rain (mm)",
-        5, 1400, suggested, 5,
-        help="Default is month × % of monthly rainfall; adjust as needed."
-    )
-    if month in ["Jun", "Jul", "Aug"]:
-        st.sidebar.caption("Dry season: storms are typically smaller/rarer (Jun–Aug).")
-    elif month in ["Mar", "Apr", "May", "Sep", "Oct", "Nov"]:
-        st.sidebar.caption("Rainy season: heavier, more frequent downpours (Mar–May, Sep–Nov).")
-    else:
-        st.sidebar.caption("Transitional period with moderate rainfall.")
-
-duration_min = st.sidebar.slider("Storm duration (minutes)", 5, 240, 60, 5)
-rain_shape = st.sidebar.selectbox("Rain shape", ["Steady", "Front-loaded", "Back-loaded", "Pulsed"])
-randiness = st.sidebar.slider("Rain randomness", 0.0, 1.0, 0.15, 0.05)
-
-# -------------------- Mound geometry (as-built) --------------------
-st.sidebar.header("🧱 Hügelkultur Mound (As-built)")
-L = st.sidebar.number_input("Mound length (m)", 1.0, 50.0, 12.0, 1.0)
-W = st.sidebar.number_input("Base width (m)", 0.5, 10.0, 2.0, 0.5)
-H = st.sidebar.number_input("Height (m)", 0.3, 3.0, 1.5, 0.1)
-porosity = st.sidebar.slider("Core porosity", 0.2, 0.9, 0.6, 0.05)
-
-# -------------------- Decomposition & Settling --------------------
-st.sidebar.header("🌲 Aging: Decomposition & Settling")
-years_since_build = st.sidebar.slider("Years since mound was built", 0, 20, 0, 1)
-
-# Storage (void-space) decay = pore loss from decomposition/compaction
-annual_storage_decay = st.sidebar.slider(
-    "Annual storage decay (void loss)", 0.00, 0.20, 0.08, 0.01,
-    help="Fractional loss of *effective storage* per year (e.g., 0.08 = 8%/yr)."
-)
-
-# NEW: Visible height settling rate (geometry sink)
-annual_height_settling = st.sidebar.slider(
-    "Annual height settling (visual)", 0.00, 0.10, 0.03, 0.01,
-    help="Reduces visible mound height to mimic shrinkage/settling over years."
-)
-
-st.sidebar.header("🧮 Catchment & Soil")
-A = st.sidebar.number_input("Contributing area (m²)", 10.0, 10000.0, 300.0, 10.0)
-CN = st.sidebar.slider("Curve Number (CN)", 55, 95, 85, 1)
-
-fps = st.sidebar.slider("Frames per second", 5, 30, 15)
-
-# -------------------- Hydrology Functions --------------------
-def scs_runoff_mm(P_mm, CN):
-    """Cumulative runoff depth (mm) via SCS-CN."""
-    S = (25400 / CN) - 254
+# -----------------------------
+# Helpers
+# -----------------------------
+def scs_runoff_depth_mm(P, CN):
+    """SCS-CN runoff depth (mm) for total event depth P."""
+    S = 25400.0 / CN - 254.0  # mm
     Ia = 0.2 * S
-    if P_mm <= Ia:
+    if P <= Ia:
         return 0.0
-    return ((P_mm - Ia) ** 2) / (P_mm - Ia + S)
+    return ((P - Ia) ** 2) / (P + 0.8 * S)
 
-def hyetograph(total_mm, minutes, shape="Steady", jitter=0.0):
-    """Rain intensity series (mm/minute)."""
-    minutes = max(int(minutes), 1)
-    t = np.linspace(0, 1, minutes)
-    if shape == "Steady":
-        base = np.ones_like(t)
-    elif shape == "Front-loaded":
-        base = (1 - t) ** 2.2 + 0.2
-    elif shape == "Back-loaded":
-        base = t ** 2.2 + 0.2
-    else:  # Pulsed
-        base = 0.35 + 0.45 * np.maximum(0, np.sin(np.pi * 5 * t))
-    base = np.clip(base, 0.05, None)
-    base /= base.sum()
-    series = base * total_mm
-    if jitter > 0:
-        rng = np.random.default_rng()
-        noise = rng.normal(0, jitter, minutes)
-        series = np.clip(series * (1 + noise), 0, None)
-        series *= total_mm / max(series.sum(), 1e-9)
-    return series
+def mm_over_area_to_m3(mm, area_m2):
+    return (mm / 1000.0) * area_m2
 
-def mound_capacity(L, W, H, phi):
-    """Triangular cross-section * length * porosity (m³)."""
-    return 0.5 * W * H * L * phi
+def hyetograph(total_depth_mm, duration_min, kind="Triangular", peak_at=0.4):
+    """Return per-minute intensities that sum to total_depth_mm."""
+    t = np.arange(duration_min, dtype=float)
+    if kind == "Uniform":
+        i = np.ones_like(t) * (total_depth_mm / duration_min)
+    elif kind == "Front-loaded":
+        # exponential decay
+        x = np.linspace(0, 3, duration_min)
+        w = np.exp(-x)
+        i = w / w.sum() * total_depth_mm
+    elif kind == "Back-loaded":
+        x = np.linspace(0, 3, duration_min)
+        w = np.exp(-x[::-1])
+        i = w / w.sum() * total_depth_mm
+    else:  # Triangular (default)
+        peak_idx = max(1, int(peak_at * (duration_min - 1)))
+        up = np.linspace(0, 1, peak_idx + 1)
+        down = np.linspace(1, 0, duration_min - peak_idx - 1)
+        shape = np.concatenate([up, down]) if down.size else up
+        i = shape / shape.sum() * total_depth_mm
+    return i
 
-# -------------------- Simulation Setup --------------------
-minutes = int(duration_min)
-rain_series = hyetograph(total_rain_mm, minutes, rain_shape, randiness)
+# -----------------------------
+# Sidebar controls
+# -----------------------------
+st.sidebar.header("Storm & Site")
+P_total = st.sidebar.slider("Storm total (mm)", 20, 200, 80, 5)
+duration_min = st.sidebar.slider("Storm duration (min)", 10, 240, 90, 5)
+hyeto_kind = st.sidebar.selectbox("Hyetograph shape", ["Triangular", "Uniform", "Front-loaded", "Back-loaded"])
+peak_at = st.sidebar.slider("Triangular peak at fraction of duration", 0.2, 0.8, 0.4, 0.05)
+area_m2 = st.sidebar.number_input("Catchment area (m²)", 100.0, 50000.0, 3000.0, 50.0)
+base_CN = st.sidebar.slider("Base Curve Number (dirt/unpaved)", 70, 95, 85, 1)
+slope = st.sidebar.selectbox("Slope condition", ["Low", "Moderate", "Steep"], index=1)
+slope_factor = {"Low": 0.95, "Moderate": 1.00, "Steep": 1.05}[slope]
 
-# As-built storage
-S_initial = mound_capacity(L, W, H, porosity)
+st.sidebar.header("Permeable Pavement")
+pp_on = st.sidebar.toggle("Enable Permeable Pavement", True)
+pp_frac = st.sidebar.slider("Fraction of area converted", 0.0, 1.0, 0.30, 0.05) if pp_on else 0.0
+pp_CN_delta = st.sidebar.slider("CN reduction on permeable area (points)", 0, 20, 8, 1) if pp_on else 0
+pp_direct_infil_pct = (st.sidebar.slider("Direct infiltration on permeable area (%)", 0, 90, 40, 5)/100.0) if pp_on else 0.0
 
-# Effective storage after years (void-space decay)
-storage_decay_factor = (1.0 - annual_storage_decay) ** years_since_build
-S_effective = S_initial * storage_decay_factor
+st.sidebar.header("Vetiver Grass")
+vet_on = st.sidebar.toggle("Enable Vetiver Grass", True)
+vet_CN_delta = st.sidebar.slider("CN reduction from vetiver (points)", 0, 12, 4, 1) if vet_on else 0
+vet_extra_infil_pct = (st.sidebar.slider("Extra infiltration on remaining runoff (%)", 0, 40, 12, 1)/100.0) if vet_on else 0.0
 
-# NEW: Visible height settling (geometry only; does NOT change storage, which is already handled)
-height_settle_factor = (1.0 - annual_height_settling) ** years_since_build
-H_visible = max(H * height_settle_factor, 0.05)  # keep a tiny floor to avoid zero-height drawing
-core_height_visible = H_visible * 0.7
+st.sidebar.header("Playback")
+speed = st.sidebar.slider("Playback speed (sim minutes / second)", 1, 20, 6, 1)
+autoloop = st.sidebar.checkbox("Loop when finished", value=False)
 
-# Initialize accumulators
-cumP = 0.0
-cum_runoff_no_mound = 0.0
-cum_runoff_with_mound = 0.0
-intercepted = 0.0
+# -----------------------------
+# Session state for "live" sim
+# -----------------------------
+if "t_idx" not in st.session_state:
+    st.session_state.t_idx = 0
+if "playing" not in st.session_state:
+    st.session_state.playing = False
+if "last_tick" not in st.session_state:
+    st.session_state.last_tick = time.time()
 
-placeholder = st.empty()
-progress = st.progress(0)
+col_btn1, col_btn2, col_btn3 = st.columns([1,1,1])
+if col_btn1.button("▶️ Play"):
+    st.session_state.playing = True
+    st.session_state.last_tick = time.time()
+if col_btn2.button("⏸️ Pause"):
+    st.session_state.playing = False
+if col_btn3.button("⏮️ Reset"):
+    st.session_state.playing = False
+    st.session_state.t_idx = 0
 
-# -------------------- Simulation Loop --------------------
-for minute in range(minutes):
-    dP = rain_series[minute]
-    Q_prev = scs_runoff_mm(cumP, CN)
-    cumP += dP
-    Q_curr = scs_runoff_mm(cumP, CN)
-    dQ = max(Q_curr - Q_prev, 0.0)      # incremental runoff depth (mm)
-    dV = (dQ / 1000.0) * A              # incremental runoff volume (m³)
-    cum_runoff_no_mound += dV
+# -----------------------------
+# Build per-minute storm + CN
+# -----------------------------
+intensities = hyetograph(P_total, duration_min, kind=hyeto_kind, peak_at=peak_at)
+cumP = np.cumsum(intensities)
 
-    # Interception by mound (from runoff only), limited by effective storage
-    if intercepted < S_effective:
-        take = min(S_effective - intercepted, dV)
-        intercepted += take
-        dV -= take
-    cum_runoff_with_mound += dV
+# Effective CN (area-weighted) BEFORE slope factor
+CN_eff = base_CN
+if vet_on:
+    CN_eff = max(30, CN_eff - vet_CN_delta)
+if pp_on and pp_frac > 0:
+    CN_perm = max(30, CN_eff - pp_CN_delta)
+    CN_eff = (1 - pp_frac) * CN_eff + pp_frac * CN_perm
+CN_eff *= slope_factor
 
-    fill_ratio = intercepted / S_effective if S_effective > 0 else 0.0
+# For live minute steps, we approximate SCS-CN **incrementally**:
+# At each minute m, compute runoff depth from cumulative rain P[0:m],
+# then take the **incremental** runoff for that minute as the difference.
+def incremental_runoff_series(intensities_mm, CN):
+    cum = np.cumsum(intensities_mm)
+    Q_tot = np.array([scs_runoff_depth_mm(P, CN) for P in cum])
+    inc = np.diff(np.concatenate([[0.0], Q_tot]))
+    inc[inc < 0] = 0.0
+    return inc, Q_tot
 
-    # ------------- Draw schematic (with visible sinking) -------------
-    fig, ax = plt.subplots(figsize=(10, 4))
-    ax.plot([0, 10], [0, 0], color="saddlebrown", linewidth=5)  # ground line
+inc_Q_mm, cum_Q_mm = incremental_runoff_series(intensities, CN_eff)
 
-    cx = 5.0
-    left = cx - W / 2.0
-    right = cx + W / 2.0
+# Partition each minute's water:
+# 1) Rain falling on permeable fraction: direct infiltration share never becomes runoff.
+rain_on_perm_mm = intensities * pp_frac
+pp_direct_infil_mm = rain_on_perm_mm * pp_direct_infil_pct
 
-    # Soil mound (visible/settled height)
-    ax.fill([left, cx, right], [0, H_visible, 0], color="#cd853f", alpha=0.7, label="Soil")
+# Convert **runoff** from SCS (which is post-generation) in mm to m³ then apply vetiver extra infiltration
+inc_Q_m3 = mm_over_area_to_m3(inc_Q_mm, area_m2)
+pp_direct_infil_m3 = mm_over_area_to_m3(pp_direct_infil_mm, area_m2)
 
-    # Core (visible/settled height)
-    ax.fill([left + 0.2, cx, right - 0.2], [0, core_height_visible, 0], color="#8b5a2b", alpha=0.5, label="Wood core")
+# After subtracting permeable direct infiltration (some generation avoidance), any remaining runoff
+# is further reduced by vetiver's extra infiltration percentage.
+runoff_after_pp_m3 = np.maximum(0.0, inc_Q_m3 - pp_direct_infil_m3)
+vetiver_extra_infil_m3 = runoff_after_pp_m3 * (vet_extra_infil_pct if vet_on else 0.0)
+effective_runoff_m3_series = np.maximum(0.0, runoff_after_pp_m3 - vetiver_extra_infil_m3)
 
-    # Stored water (limited by effective storage, drawn within visible core)
-    if fill_ratio > 0:
-        water_h = core_height_visible * min(fill_ratio, 1.0)
-        ax.fill_between([left + 0.2, right - 0.2], 0, water_h, color="dodgerblue", alpha=0.6, label="Stored water")
+# -----------------------------
+# Advance the simulation clock
+# -----------------------------
+if st.session_state.playing:
+    now = time.time()
+    dt = now - st.session_state.last_tick
+    st.session_state.last_tick = now
+    # advance by (speed * dt) simulated minutes
+    advance = int(speed * dt)
+    if advance > 0:
+        st.session_state.t_idx += advance
+        if st.session_state.t_idx >= duration_min:
+            if autoloop:
+                st.session_state.t_idx = 0
+            else:
+                st.session_state.t_idx = duration_min - 1
+                st.session_state.playing = False
+    st.experimental_rerun()
 
-    # Show dashed line marking "effective capacity" level relative to visible core
-    if years_since_build > 0 and (annual_storage_decay > 0 or annual_height_settling > 0):
-        # Translate storage decay (void loss) into a notional horizontal line inside the core
-        # purely for visual cue; does not change hydrology beyond S_effective
-        eff_ratio = max(storage_decay_factor, 0.0)
-        eff_core_h_line = core_height_visible * eff_ratio
-        ax.plot([left + 0.2, right - 0.2], [eff_core_h_line, eff_core_h_line], linestyle="--", color="black", linewidth=1)
-        ax.text(right - 0.2, eff_core_h_line + 0.03, "effective capacity", ha="right", va="bottom", fontsize=8)
+t = int(st.session_state.t_idx)  # current minute index (0 .. duration_min-1)
+if t < 0: t = 0
+if t > duration_min - 1: t = duration_min - 1
 
-    ax.set_xlim(0, 10)
-    ax.set_ylim(0, max(2, H * 1.3))  # keep y-limits stable relative to as-built H for easy comparison
-    ax.axis("off")
-    ax.set_title(
-        f"Minute {minute+1}/{minutes} | Rain {cumP:.1f} mm | "
-        f"Intercepted {intercepted:.2f} m³ | Runoff (no mound) {cum_runoff_no_mound:.2f} m³"
-    )
+# -----------------------------
+# KPIs (live)
+# -----------------------------
+baseline_CN_with_slope = base_CN * slope_factor
+baseline_Q_mm_total = scs_runoff_depth_mm(P_total, baseline_CN_with_slope)
+baseline_runoff_m3_total = mm_over_area_to_m3(baseline_Q_mm_total, area_m2)
 
-    placeholder.pyplot(fig)
-    progress.progress((minute + 1) / minutes)
-    time.sleep(1.0 / fps)
+live_cumP = cumP[t]
+live_cumQ_mm = cum_Q_mm[t]
+live_cum_runoff_m3 = np.sum(effective_runoff_m3_series[:t+1])
+live_cum_pp_direct_m3 = np.sum(pp_direct_infil_m3[:t+1])
+live_cum_vet_extra_m3 = np.sum(vetiver_extra_infil_m3[:t+1])
 
-# -------------------- Results --------------------
-st.success("✅ Simulation complete!")
-
-col1, col2, col3 = st.columns(3)
-col1.metric("🌧️ Total Rainfall", f"{cumP:.1f} mm")
-col2.metric("💦 Runoff (No Hügelkultur)", f"{cum_runoff_no_mound:.2f} m³")
-col3.metric("💧 Runoff (With Hügelkultur)", f"{cum_runoff_with_mound:.2f} m³")
-
-st.write(f"**Intercepted water volume (this storm):** {intercepted:.2f} m³")
-
-# Capacity & geometry panel
-st.markdown("### 🪵 Storage Capacity, Settling & Decomposition")
-cap1, cap2, cap3, cap4 = st.columns(4)
-S_initial_val = mound_capacity(L, W, H, porosity)
-cap1.metric("As-built capacity (m³)", f"{S_initial_val:.2f}")
-cap2.metric("Effective capacity today (m³)", f"{S_effective:.2f}")
-remain_pct = 100.0 * (S_effective / S_initial_val) if S_initial_val > 0 else 0.0
-cap3.metric("Capacity remaining", f"{remain_pct:.0f}%")
-cap4.metric("Visible height today (m)", f"{H_visible:.2f}")
-
-st.caption(
-    "Hugelbeds sink in size after several years due to wood shrinkage, decomposition and settling [2]. "
-    "Here, **effective storage** declines with *Annual storage decay*, while **visible height** sinks with *Annual height settling*."
+reduction_ratio = 1.0 - (live_cum_runoff_m3 / (baseline_runoff_m3_total + 1e-9))
+score = (
+    60 * max(0.0, reduction_ratio) +
+    20 * (pp_frac if pp_on else 0.0) +
+    20 * (1.0 if vet_on else 0.0)
 )
+score = float(np.clip(score, 0, 100))
 
-# Optional references section (shows your requested [2] marker)
-with st.expander("References"):
-    st.markdown("""
-- **[2]** Hügelkultur aging effects: shrinkage, decomposition, and settling reduce mound size and storage over time.
-    """)
+k1, k2, k3, k4 = st.columns(4)
+k1.metric("Minute", f"{t+1}/{duration_min}")
+k2.metric("Cumulative rain (mm)", f"{live_cumP:,.1f}")
+k3.metric("Cumulative runoff (m³)", f"{live_cum_runoff_m3:,.1f}")
+k4.metric("Road Protection Score", f"{score:.0f}/100")
+
+# Status banner
+status = "✅ Roads holding well" if score >= 70 else ("🟨 Watch flow paths" if score >= 40 else "🟥 Likely washouts")
+st.info(f"**Status:** {status}")
+
+st.divider()
+
+# -----------------------------
+# Live charts
+# -----------------------------
+left, right = st.columns([1.2, 1.4])
+
+with left:
+    st.subheader("Rainfall Intensity (mm/min)")
+    df_int = pd.DataFrame({"mm/min": intensities[:t+1]})
+    st.line_chart(df_int, height=220)
+
+    st.subheader("Cumulative Rain vs Runoff (mm)")
+    df_cum = pd.DataFrame({
+        "Rain (mm)": cumP[:t+1],
+        "Runoff (mm, SCS w/ solutions)": cum_Q_mm[:t+1]
+    })
+    st.line_chart(df_cum, height=220)
+
+with right:
+    st.subheader("Where did the water go? (cumulative m³)")
+    df_parts = pd.DataFrame({
+        "Remaining runoff": [live_cum_runoff_m3],
+        "Permeable direct infiltration": [live_cum_pp_direct_m3],
+        "Vetiver extra infiltration": [live_cum_vet_extra_m3],
+    }).T
+    df_parts.columns = ["m³"]
+    st.bar_chart(df_parts, height=320)
+
+st.divider()
+st.markdown("### Live Values (this minute)")
+minute_table = pd.DataFrame(
+    [
+        ("Rain this minute (mm)", intensities[t]),
+        ("Incremental runoff (mm, SCS)", inc_Q_mm[t]),
+        ("Permeable direct infil (mm)", pp_direct_infil_mm[t] if pp_on else 0.0),
+        ("Effective runoff this minute (m³)", effective_runoff_m3_series[t]),
+    ],
+    columns=["Metric", "Value"]
+)
+st.dataframe(minute_table, use_container_width=True, hide_index=True)
+
+with st.expander("Model notes"):
+    st.markdown(
+        """
+- SCS–CN is applied cumulatively; incremental runoff each minute is the difference of cumulative runoff.
+- Permeable pavement effects:
+  - **CN reduction** on the converted fraction (weighted area).
+  - **Direct infiltration %** on the permeable patch removes some rainfall before it becomes runoff.
+- Vetiver effects:
+  - **CN reduction** (global improvement).
+  - **Extra infiltration %** applied to the remaining runoff after permeable direct infiltration.
+- This is an educational planner — not a calibrated engineering design.
+        """
+    )
