@@ -3,7 +3,7 @@
 # - Land cover: forests, ground, buildings/roads that follow terrain logic
 # - Hydrology: SCS-CN runoff + simple D8 routing (toy model)
 # - 3D interactive Plotly surface (drag/zoom) + water overlay
-# - Fixed "near_road" computation (no logical_and.reduce mixup)
+# - Fixes: "near_road" neighborhood growth; settlement_score normalized as NumPy array
 
 import math
 import time
@@ -18,7 +18,7 @@ st.title("3D Mini World – HOPE Rwanda (Stormwater)")
 with st.expander("About this simulator"):
     st.markdown(
         """
-This is a **schematic** mini-world resembling a hillslope near Kigali. It generates terrain, places roads/buildings and forests
+A schematic hillslope inspired by Kigali’s terrain. It generates terrain, places roads/buildings and forests
 based on slope/elevation, and simulates storm **runoff vs infiltration** per cell (SCS-CN) with a simple **downhill routing**.
 Use it for **relative comparisons** (e.g., more forest, fewer roads) — not for engineering design.
         """
@@ -132,6 +132,8 @@ near_road = road_mask | near
 
 settlement_score = gentle.astype(float) * 0.6 + near_road.astype(float) * 1.2
 settlement_score += 0.3 * fbm_noise(H, W, octaves=2, persistence=0.7, rng=rng_local)
+# --- FIXED: ensure NumPy array before normalization ---
+settlement_score = np.asarray(settlement_score, dtype=float)
 settlement_score = (settlement_score - settlement_score.min()) / (settlement_score.ptp() + 1e-9)
 
 target_build = int(W*H*build_share)
@@ -219,7 +221,6 @@ def route_d8(Q_mm, elev, iters=1):
 # -------------------- 3D figure builder --------------------
 def cover_colorscale():
     # Discrete mapping: 0=forest (green), 1=ground (tan), 2=road/build (dark gray)
-    # We'll map numeric surfacecolor values {0,1,2} to these colors.
     return [
         [0.00, "rgb(32,128,32)"],   [0.33, "rgb(32,128,32)"],   # forest
         [0.33, "rgb(194,176,138)"], [0.66, "rgb(194,176,138)"], # ground
@@ -228,14 +229,9 @@ def cover_colorscale():
 
 def make_3d_figure(elev, world, pond_mm=None, title=""):
     H, W = elev.shape
-    # Base terrain z
     z_base = elev.copy()
-
-    # Base cover surface-color indices
-    cover_idx = world.astype(float) / 2.0  # 0, 0.5, 1.0 → but we defined segments above to handle ranges
-    # Plotly wants x,y as coordinate arrays
-    x = np.arange(W)
-    y = np.arange(H)
+    cover_idx = world.astype(float) / 2.0  # 0, 0.5, 1.0
+    x = np.arange(W); y = np.arange(H)
 
     fig = go.Figure()
 
@@ -251,12 +247,10 @@ def make_3d_figure(elev, world, pond_mm=None, title=""):
         name="Terrain"
     ))
 
-    # Optional water overlay as a semi-transparent surface slightly above the terrain
+    # Water overlay (semi-transparent)
     if pond_mm is not None:
-        # Normalize pond depth to a small vertical exaggeration relative to relief
-        pond_norm = pond_mm / (np.percentile(pond_mm, 98) + 1e-9)  # 0..~1
+        pond_norm = pond_mm / (np.percentile(pond_mm, 98) + 1e-9)
         z_water = z_base + 0.02 * relief + 0.20 * pond_norm * (relief / 1.0)
-        # Mask zero ponding so triangles don't render there
         z_water = np.where(pond_mm > 1e-6, z_water, np.nan)
         fig.add_trace(go.Surface(
             x=x, y=y, z=z_water,
@@ -266,7 +260,6 @@ def make_3d_figure(elev, world, pond_mm=None, title=""):
             name="Water"
         ))
 
-    # Camera and layout polish
     fig.update_layout(
         title=title,
         scene=dict(
@@ -344,3 +337,4 @@ with st.expander("Diagnostics & assumptions"):
 - Routing is a simplified D8 flow; use results for intuition and scenario comparison.
         """
     )
+
