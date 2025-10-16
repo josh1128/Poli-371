@@ -4,3 +4,4 @@ numpy>=1.26.0
 folium>=0.15.0
 streamlit-folium>=0.20.0
 plotly>=5.22
+pydeck
