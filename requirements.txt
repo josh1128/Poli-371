@@ -1,6 +1,8 @@
-streamlit
-numpy
 matplotlib
 folium
 streamlit-folium
 pyswmm
+streamlit==1.38.0
+pyswmm==1.3.2
+swmm-toolkit==0.11.0
+numpy==1.26.4
