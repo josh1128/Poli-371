@@ -7,12 +7,19 @@ import hydrobricks as hb
 import hydrobricks.models as models
 
 st.set_page_config(page_title="Hydrobricks minimal (Socont)", layout="centered")
-st.title("💧 Hydrobricks minimal (Socont) — no spatialization")
+st.title("💧 Hydrobricks minimal (Socont) — PET via pyet")
+
+with st.expander("Environment check"):
+    st.write({"hydrobricks_version": getattr(hb, "__version__", "unknown")})
+    try:
+        import pyet
+        st.write({"pyet_version": getattr(pyet, "__version__", "unknown")})
+    except Exception as e:
+        st.warning(f"pyet import failed: {e}")
 
 st.write(
-    "Single hydro unit + station meteorology. No spatialization calls, so the API "
-    "mismatch that caused the TypeError is avoided. We still compute PET (Hamon) "
-    "and plot outlet discharge (mm/day)."
+    "Single hydro unit + station meteorology (no spatialization). "
+    "Computes PET with **pyet** (Hamon) and plots outlet discharge (mm/day)."
 )
 
 # ----------------------------
@@ -112,8 +119,9 @@ if run:
             content={"precipitation": "precip(mm/day)", "temperature": "temp(C)"},
         )
 
-        # Compute PET (Hamon) using temperature + latitude
-        forcing.compute_pet(method="Hamon", use=["t", "lat"], lat=float(lat))
+        # Compute PET (requires pyet). Use lowercase method name to match API.
+        # Units: Hydrobricks expects PET in mm/day for this workflow.
+        forcing.compute_pet(method="hamon", use=["t", "lat"], lat=float(lat))
 
         # 4) Model + parameters
         socont = models.Socont(
@@ -157,5 +165,5 @@ if run:
         st.subheader("Outlet discharge (mm/day)")
         st.line_chart(df.set_index("time")["Q_mm_day"])
         st.dataframe(df.head())
-        st.success("✅ Hydrobricks run complete (single hydro unit, no spatialization).")
+        st.success("✅ Run complete (pyet installed; PET computed).")
 
