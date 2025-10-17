@@ -4,8 +4,3 @@ folium>=0.15.0
 streamlit-folium>=0.20.0
 plotly>=5.22
 streamlit==1.36.0
-numpy==1.26.4
-pandas==2.2.2
-matplotlib==3.8.4
-swmm-toolkit==0.10.2
-pyswmm==1.3.2
