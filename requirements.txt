@@ -3,6 +3,7 @@ folium
 streamlit-folium
 pyswmm
 streamlit==1.38.0
-hydrobricks
-pandas
-matplotlib
+hydrobricks==0.8.5
+pandas>=2.2
+numpy>=1.26
+xarray
