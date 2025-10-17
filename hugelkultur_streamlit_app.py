@@ -10,7 +10,7 @@ st.set_page_config(page_title="Hydrobricks minimal (Socont)", layout="centered")
 st.title("💧 Hydrobricks minimal (Socont)")
 
 st.write(
-    "This demo creates tiny CSV inputs (elevation bands with units, daily meteo) "
+    "This demo creates tiny CSV inputs (elevation bands with units + id, daily meteo) "
     "and runs the Socont model for 30 days. It then plots outlet discharge (mm/day)."
 )
 
@@ -19,20 +19,21 @@ st.write(
 # ----------------------------
 def write_elevation_csv(path: str):
     """
-    Hydrobricks expects a second header row with units.
-    We provide elevation [m] and area [m2].
+    Hydrobricks requires:
+      - a first column named 'id'
+      - a second header row with units for each column
+    Use '-' (no units) for id, 'm' for elevation, 'm2' for area.
     """
     with open(path, "w") as f:
-        f.write("elevation,area\n")
-        f.write("m,m2\n")                    # REQUIRED units row
-        f.write("1100,3000000\n")
-        f.write("1300,4000000\n")
-        f.write("1500,3000000\n")
+        f.write("id,elevation,area\n")
+        f.write("-,m,m2\n")                 # REQUIRED units row
+        f.write("1,1100,3000000\n")
+        f.write("2,1300,4000000\n")
+        f.write("3,1500,3000000\n")
 
 def write_meteo_csv(path: str):
     """
     Simple 30-day daily series with a small rainfall pulse and mild temperatures.
-    Column names are referenced below when loading station data.
     """
     t = pd.date_range("2000-01-01", periods=30, freq="D")
     precip = np.zeros(30)
@@ -46,9 +47,7 @@ def write_meteo_csv(path: str):
     df.to_csv(path, index=False)
 
 def write_obs_csv(path: str):
-    """
-    Optional: observed discharge (mm/day). Here just zeros for the demo.
-    """
+    """Optional observed discharge (mm/day)."""
     t = pd.date_range("2000-01-01", periods=30, freq="D")
     df = pd.DataFrame({
         "Date": t.strftime("%d/%m/%Y"),
@@ -58,22 +57,20 @@ def write_obs_csv(path: str):
 
 def safe_set_params(params, values: dict):
     """
-    Hydrobricks parameters have allowed ranges. If a target value is outside,
-    widen the range just enough, then set. Keeps things robust for demos.
+    Make sure chosen parameter values fit allowed ranges by widening them slightly
+    before setting (prevents ValueError on range checks).
     """
     for name, v in values.items():
         v = float(v)
-        # Try to widen range modestly around target value
         try:
             span = max(abs(v) * 0.5, 1e-3)
             params.change_range(name, v - span, v + span)
         except Exception:
-            # Not all parameters support change_range; ignore if not available
             pass
     params.set_values(values)
 
 # ----------------------------
-# UI (optional sliders to tweak a few params)
+# UI (optional sliders)
 # ----------------------------
 with st.expander("Adjust parameters (optional)"):
     A = st.slider("Degree-day factor snow (A)", 50.0, 600.0, 200.0, 10.0)
@@ -98,7 +95,6 @@ if run:
         write_elevation_csv(elev_csv)
         write_meteo_csv(meteo_csv)
 
-        # Optionally scale rainfall by slider (edit the CSV we just wrote)
         if rain_scale != 1.0:
             dfm = pd.read_csv(meteo_csv)
             dfm["precip(mm/day)"] = dfm["precip(mm/day)"] * float(rain_scale)
@@ -106,7 +102,7 @@ if run:
 
         write_obs_csv(obs_csv)
 
-        # 2) Hydro units (no kwargs — units row is already in the CSV)
+        # 2) Hydro units (no kwargs — units row & id are in the CSV)
         hydro_units = hb.HydroUnits()
         hydro_units.load_from_csv(elev_csv)
 
@@ -122,16 +118,11 @@ if run:
             },
         )
 
-        # Simple spatialization: lapse rate & precipitation gradient
-        # NOTE: Gradients are per 100 m in this demo-style call.
+        # Simple spatialization: lapse rate & precipitation gradient (per 100 m)
         ref_z = 1250
-        forcing.spatialize_from_station_data(
-            "temperature", ref_elevation=ref_z, gradient=-0.6  # -0.6 °C / 100 m
-        )
+        forcing.spatialize_from_station_data("temperature", ref_elevation=ref_z, gradient=-0.6)  # -0.6 °C/100 m
         forcing.correct_station_data("precipitation", correction_factor=0.9)
-        forcing.spatialize_from_station_data(
-            "precipitation", ref_elevation=ref_z, gradient=0.05  # +5% / 100 m
-        )
+        forcing.spatialize_from_station_data("precipitation", ref_elevation=ref_z, gradient=0.05)  # +5%/100 m
         forcing.compute_pet(method="Hamon", use=["t", "lat"], lat=47.3)
 
         # 4) Model and parameters
@@ -142,7 +133,6 @@ if run:
         )
         params = socont.generate_parameters()
 
-        # Set a small, safe parameter set (ranges widened if needed)
         desired_params = {
             "A": A,
             "a_snow": a_snow,
@@ -172,14 +162,12 @@ if run:
         socont.initialize_state_variables(parameters=params, forcing=forcing)
         socont.run(parameters=params, forcing=forcing)
 
-        # 7) Results → DataFrame → Plot
+        # 7) Results → plot
         sim_ts = socont.get_outlet_discharge()  # xarray.DataArray (mm/day)
         df = sim_ts.to_dataframe(name="Q_mm_day").reset_index()
         st.subheader("Outlet discharge (mm/day)")
         st.line_chart(df.set_index("time")["Q_mm_day"])
 
-        # Quick peek at first rows
         st.dataframe(df.head())
         st.success("✅ Hydrobricks run complete.")
 
-        st.success("✅ Hydrobricks run complete.")
