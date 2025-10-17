@@ -7,7 +7,7 @@ import hydrobricks as hb
 import hydrobricks.models as models
 
 st.set_page_config(page_title="Hydrobricks minimal (Socont)", layout="centered")
-st.title("💧 Hydrobricks minimal (Socont) — PET via pyet")
+st.title("💧 Hydrobricks minimal (Socont) — robust demo")
 
 with st.expander("Environment check"):
     st.write({"hydrobricks_version": getattr(hb, "__version__", "unknown")})
@@ -18,8 +18,8 @@ with st.expander("Environment check"):
         st.warning(f"pyet import failed: {e}")
 
 st.write(
-    "Single hydro unit + station meteorology (no spatialization). "
-    "Computes PET with **pyet** (Hamon) and plots outlet discharge (mm/day)."
+    "Single hydro unit + station meteo (no spatialization). "
+    "Computes PET with pyet (Hamon) and plots outlet discharge (mm/day)."
 )
 
 # ----------------------------
@@ -78,6 +78,43 @@ def safe_set_params(params, values: dict):
             pass
     params.set_values(values)
 
+# Convert whatever Hydrobricks returns to a pandas Series with datetime index
+def to_series(obj):
+    import pandas as pd
+    try:
+        import xarray as xr
+    except Exception:
+        xr = None
+
+    # xarray.DataArray -> Series
+    if xr is not None and isinstance(obj, xr.DataArray):
+        s = obj.to_series().rename("Q_mm_day")
+        if isinstance(s.index, pd.MultiIndex) and "time" in s.index.names:
+            s = s.reset_index().set_index("time")["Q_mm_day"]
+        return s
+
+    # pandas Series -> Series
+    if isinstance(obj, pd.Series):
+        return obj.rename("Q_mm_day")
+
+    # pandas DataFrame -> first column as Series
+    if isinstance(obj, pd.DataFrame):
+        first_col = obj.columns[0]
+        return obj[first_col].rename("Q_mm_day")
+
+    # ndarray/list -> build a daily index
+    try:
+        import numpy as np
+        if isinstance(obj, (list, tuple)) or isinstance(obj, np.ndarray):
+            n = len(obj)
+            idx = pd.date_range("2000-01-01", periods=n, freq="D")
+            return pd.Series(obj, index=idx, name="Q_mm_day")
+    except Exception:
+        pass
+
+    # Fallback: single value
+    return pd.Series([float(obj)], index=pd.date_range("2000-01-01", periods=1), name="Q_mm_day")
+
 # ----------------------------
 # UI
 # ----------------------------
@@ -119,8 +156,7 @@ if run:
             content={"precipitation": "precip(mm/day)", "temperature": "temp(C)"},
         )
 
-        # Compute PET (requires pyet). Use lowercase method name to match API.
-        # Units: Hydrobricks expects PET in mm/day for this workflow.
+        # Compute PET (requires pyet). Use lowercase method to match API.
         forcing.compute_pet(method="hamon", use=["t", "lat"], lat=float(lat))
 
         # 4) Model + parameters
@@ -159,11 +195,13 @@ if run:
         socont.initialize_state_variables(parameters=params, forcing=forcing)
         socont.run(parameters=params, forcing=forcing)
 
-        # 7) Results → plot
-        sim_ts = socont.get_outlet_discharge()  # xarray.DataArray (mm/day)
-        df = sim_ts.to_dataframe(name="Q_mm_day").reset_index()
+        # 7) Results → plot (robust to multiple return types)
+        sim_ts = socont.get_outlet_discharge()
+        st.write("Return type:", type(sim_ts).__name__)
+        series = to_series(sim_ts)
+
         st.subheader("Outlet discharge (mm/day)")
-        st.line_chart(df.set_index("time")["Q_mm_day"])
-        st.dataframe(df.head())
-        st.success("✅ Run complete (pyet installed; PET computed).")
+        st.line_chart(series)
+        st.dataframe(series.reset_index().rename(columns={"index": "time"}).head())
+        st.success("✅ Run complete.")
 
