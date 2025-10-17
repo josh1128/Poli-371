@@ -1,262 +1,242 @@
-# hugelkultur_map_impact_free.py
-# Hügelkultur impact simulation – HOPE Rwanda (Rwabutenge, Gahanga, Kicukiro)
-# - Rain slider up to 1,400 mm
-# - Wood decomposition reduces effective storage over time
-# - NEW: Visible mound "sinking" over years due to shrinkage/settling (separate height settling rate)
-# - Displays note: "Hugelbeds sink in size after several years..." [2]
+# app.py
+# Streamlit + PySWMM "one-subcatchment" runoff simulator
+# - Builds a minimal SWMM .inp file from your slider settings
+# - Runs the engine via pyswmm
+# - Plots hydrograph and cumulative runoff volume
 
-import math, time
+import tempfile
+from datetime import datetime, timedelta
 import numpy as np
+import pandas as pd
 import streamlit as st
 import matplotlib.pyplot as plt
-import folium
-from streamlit_folium import st_folium
 
-# -------------------- Page setup --------------------
-st.set_page_config(page_title="Hügelkultur Impact – HOPE Rwanda", layout="wide")
-st.title("💧 Hügelkultur Impact Simulation – HOPE Rwanda Site (Rwabutenge, Gahanga, Kicukiro)")
+from pyswmm import Simulation, Subcatchments
 
-# -------------------- Free Map (OpenStreetMap) --------------------
-SITE_LAT, SITE_LON = -2.0344, 30.1318
-with st.expander("🗺️ View Project Site Map", expanded=True):
-    m = folium.Map(location=[SITE_LAT, SITE_LON], zoom_start=14, tiles="OpenStreetMap")
-    folium.Marker(
-        [SITE_LAT, SITE_LON],
-        popup="HOPE Rwanda Project Site – Rwabutenge, Gahanga Sector",
-        tooltip="Click for details",
-        icon=folium.Icon(color="red", icon="tint")
-    ).add_to(m)
-    folium.LayerControl().add_to(m)
-    st_folium(m, width=700, height=450)
+st.set_page_config(page_title="Simple Runoff (PySWMM)", layout="wide")
+st.title("💧 Simple Runoff Simulation (PySWMM + Streamlit)")
 
-st.markdown(
-    """
-    This tool simulates a **rainfall event** and compares **runoff** with and without a Hügelkultur mound.
-    The mound stores rainwater like a sponge, reducing surface runoff and erosion.
-    """
-)
+# ---------------- Sidebar controls ----------------
+st.sidebar.header("Storm")
+P_mm = st.sidebar.slider("Total storm depth (mm)", 5, 1400, 60, 5)
+dur_hr = st.sidebar.slider("Storm duration (hours)", 0.25, 24.0, 2.0, 0.25)
+dt_min = st.sidebar.slider("Hyetograph step (minutes)", 1, 30, 5, 1)
 
-# -------------------- Sidebar Controls ----------------------
-st.sidebar.header("🌧️ Storm Parameters")
+st.sidebar.header("Subcatchment")
+area_ha = st.sidebar.slider("Area (hectares)", 0.1, 20.0, 2.0, 0.1)
+pct_imp = st.sidebar.slider("Impervious (%)", 0, 100, 30, 1)
+slope_pct = st.sidebar.slider("Average slope (%)", 0.1, 20.0, 2.0, 0.1)
+width_m = st.sidebar.slider("Characteristic width (m)", 10, 2000, 200, 10)
+rough_perv = st.sidebar.number_input("Manning n (pervious)", min_value=0.01, value=0.24, step=0.01, format="%.2f")
+rough_imp = st.sidebar.number_input("Manning n (impervious)", min_value=0.01, value=0.013, step=0.001, format="%.3f")
+pct_zero_storage = st.sidebar.slider("Impervious with zero storage (%)", 0, 100, 25, 5)
+depress_perv_mm = st.sidebar.number_input("Depression storage pervious (mm)", min_value=0.0, value=5.0, step=0.5)
+depress_imp_mm = st.sidebar.number_input("Depression storage impervious (mm)", min_value=0.0, value=1.5, step=0.5)
 
-# Rwanda monthly rainfall guide (mm): dry Jun–Aug; rainy Mar–May & Sep–Nov
-monthly_mm = {
-    "Jan": 100, "Feb": 110, "Mar": 120, "Apr": 150, "May": 150,
-    "Jun": 20,  "Jul": 15,  "Aug": 30,
-    "Sep": 110, "Oct": 120, "Nov": 130, "Dec": 100
-}
-
-rain_input_mode = st.sidebar.radio(
-    "Rain input",
-    ["Manual", "Rwanda seasonal preset"],
-    index=1,
-    help="Use Rwanda presets to reflect dry (Jun–Aug) vs rainy seasons (Mar–May, Sep–Nov)."
-)
-
-if rain_input_mode == "Manual":
-    total_rain_mm = st.sidebar.slider("Total storm rain (mm)", 5, 1400, 120, 5)
+st.sidebar.header("Infiltration")
+model_choice = st.sidebar.selectbox("Model", ["Green-Ampt", "Horton"])
+if model_choice == "Green-Ampt":
+    # Typical sandy loam-ish defaults (adjust as needed)
+    ga_suction_mm = st.sidebar.number_input("Suction head (mm)", 20.0, 300.0, 110.0, 1.0)
+    ga_Ksat_mmhr = st.sidebar.number_input("Hydraulic conductivity (mm/hr)", 1.0, 100.0, 12.0, 0.5)
+    ga_IMD = st.sidebar.number_input("Initial moisture deficit (0–1)", 0.0, 1.0, 0.4, 0.05)
 else:
-    month = st.sidebar.selectbox("Month (Rwanda climate)", list(monthly_mm.keys()), index=3)
-    monthly_total = monthly_mm[month]
-    storm_pct = st.sidebar.select_slider(
-        "Storm size (% of monthly total)",
-        options=[5, 10, 15, 20, 25, 30, 40, 50],
-        value=10,
-        help="Downpours are common; larger values approximate intense events."
-    )
-    suggested = int(round(monthly_total * storm_pct / 100.0))
-    total_rain_mm = st.sidebar.slider(
-        "Total storm rain (mm)",
-        5, 1400, suggested, 5,
-        help="Default is month × % of monthly rainfall; adjust as needed."
-    )
-    if month in ["Jun", "Jul", "Aug"]:
-        st.sidebar.caption("Dry season: storms are typically smaller/rarer (Jun–Aug).")
-    elif month in ["Mar", "Apr", "May", "Sep", "Oct", "Nov"]:
-        st.sidebar.caption("Rainy season: heavier, more frequent downpours (Mar–May, Sep–Nov).")
+    # Horton defaults
+    hort_f0 = st.sidebar.number_input("f0 initial infil (mm/hr)", 1.0, 200.0, 60.0, 1.0)
+    hort_fmin = st.sidebar.number_input("fmin minimum infil (mm/hr)", 0.1, 50.0, 6.0, 0.1)
+    hort_decay = st.sidebar.number_input("decay (1/hr)", 0.1, 10.0, 3.0, 0.1)
+
+st.sidebar.header("Run")
+run_btn = st.sidebar.button("Run Simulation")
+
+# ---------------- Helpers ----------------
+def make_rectangular_hyetograph(total_mm, dur_hr, dt_minutes):
+    """Return a pandas DataFrame with datetime and intensity (in/hr) for SWMM TIMESERIES."""
+    start = datetime(2020, 1, 1, 0, 0, 0)
+    times = pd.date_range(start, start + timedelta(hours=dur_hr), freq=f"{int(dt_minutes)}min")
+    if len(times) < 2:
+        times = pd.date_range(start, start + timedelta(hours=dur_hr), freq="1min")
+    # Average intensity in in/hr
+    total_in = total_mm / 25.4
+    I_in_hr = total_in / dur_hr if dur_hr > 0 else 0.0
+    intens = np.zeros(len(times))
+    intens[:-1] = I_in_hr  # hold last point at 0
+    return pd.DataFrame({"time": times, "intensity_in_hr": intens})
+
+def build_swmm_inp(ts_df,
+                   area_ha, pct_imp, slope_pct, width_m,
+                   rough_perv, rough_imp,
+                   pct_zero_storage,
+                   depress_perv_mm, depress_imp_mm,
+                   infil_model, infil_params):
+    """Create a minimal SWMM input file as a string."""
+    # Units & conversions
+    area_acres = area_ha * 2.47105
+    slope = slope_pct / 100.0
+    z_pcnt = pct_zero_storage
+    stor_perv_in = depress_perv_mm / 25.4
+    stor_imp_in = depress_imp_mm / 25.4
+
+    # TIMESERIES block
+    ts_lines = ["[TIMESERIES]"]
+    for _, row in ts_df.iterrows():
+        # SWMM expects hh:mm and value. We use absolute datetime; engine uses clock times.
+        ts_lines.append(f"Rain1 {row['time'].strftime('%Y-%m-%d')} {row['time'].strftime('%H:%M')} {row['intensity_in_hr']:.6f}")
+    ts_block = "\n".join(ts_lines)
+
+    # Infiltration
+    if infil_model == "Green-Ampt":
+        suction_in, Ksat_in_hr, IMD = infil_params
+        infil_block = "[INFILTRATION]\n" \
+                      f"S1 {suction_in:.4f} {Ksat_in_hr:.4f} {IMD:.4f}\n"
+        infil_opt = "INFILTRATION GREEN_AMPT"
     else:
-        st.sidebar.caption("Transitional period with moderate rainfall.")
+        f0_in, fmin_in, decay = infil_params
+        infil_block = "[INFILTRATION]\n" \
+                      f"S1 {f0_in:.4f} {fmin_in:.4f} {decay:.4f}\n"
+        infil_opt = "INFILTRATION HORTON"
 
-duration_min = st.sidebar.slider("Storm duration (minutes)", 5, 240, 60, 5)
-rain_shape = st.sidebar.selectbox("Rain shape", ["Steady", "Front-loaded", "Back-loaded", "Pulsed"])
-randiness = st.sidebar.slider("Rain randomness", 0.0, 1.0, 0.15, 0.05)
+    # Full .inp text
+    inp = f"""
+[TITLE]
+;; Project Title/Notes
+HOPE Rwanda – Simple One-Subcatchment Runoff
 
-# -------------------- Mound geometry (as-built) --------------------
-st.sidebar.header("🧱 Hügelkultur Mound (As-built)")
-L = st.sidebar.number_input("Mound length (m)", 1.0, 50.0, 12.0, 1.0)
-W = st.sidebar.number_input("Base width (m)", 0.5, 10.0, 2.0, 0.5)
-H = st.sidebar.number_input("Height (m)", 0.3, 3.0, 1.5, 0.1)
-porosity = st.sidebar.slider("Core porosity", 0.2, 0.9, 0.6, 0.05)
+[OPTIONS]
+FLOW_UNITS              CFS
+INFILTRATION            {infil_opt.split()[-1]}
+FLOW_ROUTING            KINWAVE
+START_DATE              01/01/2020
+START_TIME              00:00:00
+REPORT_START_DATE       01/01/2020
+REPORT_START_TIME       00:00:00
+END_DATE                01/02/2020
+END_TIME                00:00:00
+SWEEP_START             01/01
+SWEEP_END               12/31
+DRY_DAYS                0
+REPORT_STEP             00:05:00
+WET_STEP                00:01:00
+ROUTING_STEP            00:00:30
+ALLOW_PONDING           NO
+LINK_OFFSETS            DEPTH
+MIN_SLOPE               0
 
-# -------------------- Decomposition & Settling --------------------
-st.sidebar.header("🌲 Aging: Decomposition & Settling")
-years_since_build = st.sidebar.slider("Years since mound was built", 0, 20, 0, 1)
+[RAINGAGES]
+;;Name           Format    Interval SCF  Source
+RG1              INTENSITY 0:05     1.0  TIMESERIES Rain1
 
-# Storage (void-space) decay = pore loss from decomposition/compaction
-annual_storage_decay = st.sidebar.slider(
-    "Annual storage decay (void loss)", 0.00, 0.20, 0.08, 0.01,
-    help="Fractional loss of *effective storage* per year (e.g., 0.08 = 8%/yr)."
-)
+{ts_block}
 
-# NEW: Visible height settling rate (geometry sink)
-annual_height_settling = st.sidebar.slider(
-    "Annual height settling (visual)", 0.00, 0.10, 0.03, 0.01,
-    help="Reduces visible mound height to mimic shrinkage/settling over years."
-)
+[JUNCTIONS]
+;;Name           Elevation  MaxDepth  InitDepth  SurDepth  Aponded
+J1               0          0         0          0         0
 
-st.sidebar.header("🧮 Catchment & Soil")
-A = st.sidebar.number_input("Contributing area (m²)", 10.0, 10000.0, 300.0, 10.0)
-CN = st.sidebar.slider("Curve Number (CN)", 55, 95, 85, 1)
+[OUTFALLS]
+;;Name           Elevation  Type       Stage Data       Gated
+O1               0          FREE                       NO
 
-fps = st.sidebar.slider("Frames per second", 5, 30, 15)
+[SUBCATCHMENTS]
+;;Name  Raingage  Outlet  Area     %Imperv  Width  %Slope   CurbLen  SnowPack
+S1      RG1       O1      {area_acres:.4f} {pct_imp:.2f} {width_m:.2f} {slope:.4f} 0
 
-# -------------------- Hydrology Functions --------------------
-def scs_runoff_mm(P_mm, CN):
-    """Cumulative runoff depth (mm) via SCS-CN."""
-    S = (25400 / CN) - 254
-    Ia = 0.2 * S
-    if P_mm <= Ia:
-        return 0.0
-    return ((P_mm - Ia) ** 2) / (P_mm - Ia + S)
+[SUBAREAS]
+;;Subcatch  N-Imperv   N-Perv   S-Imperv   S-Perv   %Zero-Imperv   RouteTo    %Routed
+S1         {rough_imp:.3f}     {rough_perv:.3f}   {stor_imp_in:.3f}     {stor_perv_in:.3f}    {z_pcnt:.1f}            OUTLET     100
 
-def hyetograph(total_mm, minutes, shape="Steady", jitter=0.0):
-    """Rain intensity series (mm/minute)."""
-    minutes = max(int(minutes), 1)
-    t = np.linspace(0, 1, minutes)
-    if shape == "Steady":
-        base = np.ones_like(t)
-    elif shape == "Front-loaded":
-        base = (1 - t) ** 2.2 + 0.2
-    elif shape == "Back-loaded":
-        base = t ** 2.2 + 0.2
-    else:  # Pulsed
-        base = 0.35 + 0.45 * np.maximum(0, np.sin(np.pi * 5 * t))
-    base = np.clip(base, 0.05, None)
-    base /= base.sum()
-    series = base * total_mm
-    if jitter > 0:
-        rng = np.random.default_rng()
-        noise = rng.normal(0, jitter, minutes)
-        series = np.clip(series * (1 + noise), 0, None)
-        series *= total_mm / max(series.sum(), 1e-9)
-    return series
+{infil_block}
 
-def mound_capacity(L, W, H, phi):
-    """Triangular cross-section * length * porosity (m³)."""
-    return 0.5 * W * H * L * phi
+[REPORT]
+SUBCATCHMENTS ALL
+NODES ALL
+LINKS NONE
 
-# -------------------- Simulation Setup --------------------
-minutes = int(duration_min)
-rain_series = hyetograph(total_rain_mm, minutes, rain_shape, randiness)
+[TAGS]
 
-# As-built storage
-S_initial = mound_capacity(L, W, H, porosity)
+[END]
+""".strip()
+    return inp
 
-# Effective storage after years (void-space decay)
-storage_decay_factor = (1.0 - annual_storage_decay) ** years_since_build
-S_effective = S_initial * storage_decay_factor
+def run_swmm_from_string(inp_text):
+    """Run SWMM given full .inp text, return times and runoff series for S1."""
+    with tempfile.NamedTemporaryFile(mode="w+", suffix=".inp", delete=False) as f:
+        f.write(inp_text)
+        f.flush()
+        path = f.name
 
-# NEW: Visible height settling (geometry only; does NOT change storage, which is already handled)
-height_settle_factor = (1.0 - annual_height_settling) ** years_since_build
-H_visible = max(H * height_settle_factor, 0.05)  # keep a tiny floor to avoid zero-height drawing
-core_height_visible = H_visible * 0.7
+    times, q = [], []
+    with Simulation(path) as sim:
+        sub = Subcatchments(sim)["S1"]
+        for _ in sim:
+            times.append(sim.current_time)
+            q.append(sub.runoff)  # m3/s
+    return pd.DataFrame({"time": pd.to_datetime(times), "runoff_cumecs": q})
 
-# Initialize accumulators
-cumP = 0.0
-cum_runoff_no_mound = 0.0
-cum_runoff_with_mound = 0.0
-intercepted = 0.0
+# ---------------- Build & Run ----------------
+if run_btn:
+    # Hyetograph + conversions for infiltration
+    ts = make_rectangular_hyetograph(P_mm, dur_hr, dt_min)
 
-placeholder = st.empty()
-progress = st.progress(0)
+    if model_choice == "Green-Ampt":
+        # Convert Green-Ampt params to inches/hr and inches for SWMM input
+        ga_suction_in = (ga_suction_mm / 25.4)
+        ga_Ksat_in_hr = (ga_Ksat_mmhr / 25.4)
+        infil_params = (ga_suction_in, ga_Ksat_in_hr, ga_IMD)
+    else:
+        # Horton params are in length/time units SWMM expects inches/hr
+        infil_params = (hort_f0 / 25.4, hort_fmin / 25.4, hort_decay)
 
-# -------------------- Simulation Loop --------------------
-for minute in range(minutes):
-    dP = rain_series[minute]
-    Q_prev = scs_runoff_mm(cumP, CN)
-    cumP += dP
-    Q_curr = scs_runoff_mm(cumP, CN)
-    dQ = max(Q_curr - Q_prev, 0.0)      # incremental runoff depth (mm)
-    dV = (dQ / 1000.0) * A              # incremental runoff volume (m³)
-    cum_runoff_no_mound += dV
-
-    # Interception by mound (from runoff only), limited by effective storage
-    if intercepted < S_effective:
-        take = min(S_effective - intercepted, dV)
-        intercepted += take
-        dV -= take
-    cum_runoff_with_mound += dV
-
-    fill_ratio = intercepted / S_effective if S_effective > 0 else 0.0
-
-    # ------------- Draw schematic (with visible sinking) -------------
-    fig, ax = plt.subplots(figsize=(10, 4))
-    ax.plot([0, 10], [0, 0], color="saddlebrown", linewidth=5)  # ground line
-
-    cx = 5.0
-    left = cx - W / 2.0
-    right = cx + W / 2.0
-
-    # Soil mound (visible/settled height)
-    ax.fill([left, cx, right], [0, H_visible, 0], color="#cd853f", alpha=0.7, label="Soil")
-
-    # Core (visible/settled height)
-    ax.fill([left + 0.2, cx, right - 0.2], [0, core_height_visible, 0], color="#8b5a2b", alpha=0.5, label="Wood core")
-
-    # Stored water (limited by effective storage, drawn within visible core)
-    if fill_ratio > 0:
-        water_h = core_height_visible * min(fill_ratio, 1.0)
-        ax.fill_between([left + 0.2, right - 0.2], 0, water_h, color="dodgerblue", alpha=0.6, label="Stored water")
-
-    # Show dashed line marking "effective capacity" level relative to visible core
-    if years_since_build > 0 and (annual_storage_decay > 0 or annual_height_settling > 0):
-        # Translate storage decay (void loss) into a notional horizontal line inside the core
-        # purely for visual cue; does not change hydrology beyond S_effective
-        eff_ratio = max(storage_decay_factor, 0.0)
-        eff_core_h_line = core_height_visible * eff_ratio
-        ax.plot([left + 0.2, right - 0.2], [eff_core_h_line, eff_core_h_line], linestyle="--", color="black", linewidth=1)
-        ax.text(right - 0.2, eff_core_h_line + 0.03, "effective capacity", ha="right", va="bottom", fontsize=8)
-
-    ax.set_xlim(0, 10)
-    ax.set_ylim(0, max(2, H * 1.3))  # keep y-limits stable relative to as-built H for easy comparison
-    ax.axis("off")
-    ax.set_title(
-        f"Minute {minute+1}/{minutes} | Rain {cumP:.1f} mm | "
-        f"Intercepted {intercepted:.2f} m³ | Runoff (no mound) {cum_runoff_no_mound:.2f} m³"
+    inp = build_swmm_inp(
+        ts_df=ts,
+        area_ha=area_ha,
+        pct_imp=pct_imp,
+        slope_pct=slope_pct,
+        width_m=width_m,
+        rough_perv=rough_perv,
+        rough_imp=rough_imp,
+        pct_zero_storage=pct_zero_storage,
+        depress_perv_mm=depress_perv_mm,
+        depress_imp_mm=depress_imp_mm,
+        infil_model=model_choice,
+        infil_params=infil_params
     )
 
-    placeholder.pyplot(fig)
-    progress.progress((minute + 1) / minutes)
-    time.sleep(1.0 / fps)
+    df = run_swmm_from_string(inp)
 
-# -------------------- Results --------------------
-st.success("✅ Simulation complete!")
+    # Integrate flow to volume (m^3)
+    if len(df) >= 2:
+        dt_sec = (df["time"].diff().dt.total_seconds()).fillna(0).to_numpy()
+        vol = np.cumsum(df["runoff_cumecs"].to_numpy() * dt_sec)  # m^3
+    else:
+        vol = np.zeros(len(df))
+    df["cumulative_m3"] = vol
 
-col1, col2, col3 = st.columns(3)
-col1.metric("🌧️ Total Rainfall", f"{cumP:.1f} mm")
-col2.metric("💦 Runoff (No Hügelkultur)", f"{cum_runoff_no_mound:.2f} m³")
-col3.metric("💧 Runoff (With Hügelkultur)", f"{cum_runoff_with_mound:.2f} m³")
+    col1, col2 = st.columns(2)
+    with col1:
+        st.subheader("Runoff hydrograph (m³/s)")
+        fig1, ax1 = plt.subplots()
+        ax1.plot(df["time"], df["runoff_cumecs"])
+        ax1.set_xlabel("Time")
+        ax1.set_ylabel("Runoff (m³/s)")
+        ax1.grid(True, alpha=0.3)
+        st.pyplot(fig1)
 
-st.write(f"**Intercepted water volume (this storm):** {intercepted:.2f} m³")
+    with col2:
+        st.subheader("Cumulative runoff volume (m³)")
+        fig2, ax2 = plt.subplots()
+        ax2.plot(df["time"], df["cumulative_m3"])
+        ax2.set_xlabel("Time")
+        ax2.set_ylabel("Volume (m³)")
+        ax2.grid(True, alpha=0.3)
+        st.pyplot(fig2)
 
-# Capacity & geometry panel
-st.markdown("### 🪵 Storage Capacity, Settling & Decomposition")
-cap1, cap2, cap3, cap4 = st.columns(4)
-S_initial_val = mound_capacity(L, W, H, porosity)
-cap1.metric("As-built capacity (m³)", f"{S_initial_val:.2f}")
-cap2.metric("Effective capacity today (m³)", f"{S_effective:.2f}")
-remain_pct = 100.0 * (S_effective / S_initial_val) if S_initial_val > 0 else 0.0
-cap3.metric("Capacity remaining", f"{remain_pct:.0f}%")
-cap4.metric("Visible height today (m)", f"{H_visible:.2f}")
+    st.divider()
+    st.subheader("Key numbers")
+    st.write(f"- **Total storm**: {P_mm:.0f} mm over {dur_hr:.2f} h")
+    st.write(f"- **Peak runoff**: {df['runoff_cumecs'].max():.4f} m³/s")
+    st.write(f"- **Total runoff volume**: {df['cumulative_m3'].iloc[-1]:.1f} m³")
+    st.download_button("⬇️ Download generated SWMM input (.inp)", data=inp, file_name="hope_rwanda_simple.inp", mime="text/plain")
 
-st.caption(
-    "Hugelbeds sink in size after several years due to wood shrinkage, decomposition and settling [2]. "
-    "Here, **effective storage** declines with *Annual storage decay*, while **visible height** sinks with *Annual height settling*."
-)
-
-# Optional references section (shows your requested [2] marker)
-with st.expander("References"):
-    st.markdown("""
-- **[2]** Hügelkultur aging effects: shrinkage, decomposition, and settling reduce mound size and storage over time.
-    """)
+else:
+    st.info("Set your sliders, then click **Run Simulation** in the sidebar.")
 
