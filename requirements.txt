@@ -1,6 +1,4 @@
-streamlit>=1.38.0
-matplotlib>=3.8.0
-folium>=0.15.0
-streamlit-folium>=0.20.0
-plotly>=5.22
-streamlit==1.36.0
+streamlit
+matplotlib
+folium
+plotly
