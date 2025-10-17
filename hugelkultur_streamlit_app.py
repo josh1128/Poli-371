@@ -1,10 +1,20 @@
-# pyswmm_minimal.py
-# Requires: pip install pyswmm
+# streamlit_pyswmm_min.py
+# Streamlit-friendly PySWMM demo: writes files into a temp dir and runs safely.
+# requirements.txt (recommended pins below in this message)
 
+import os, textwrap
+import streamlit as st
+from tempfile import TemporaryDirectory
 from pyswmm import Simulation, Nodes, Links, Subcatchments
 
-# --- 1) Write a very small SWMM input file -------------------------------
-inp_text = r"""
+st.set_page_config(page_title="PySWMM Minimal", layout="centered")
+st.title("PySWMM Minimal – Tempdir-safe run")
+
+# --- Small controls just to vary something ---
+storm_peak = st.slider("Peak intensity (mm/hr)", 10, 60, 30, 5)
+
+# --- Build an INP string (tiny model) ---
+inp_text = textwrap.dedent(f"""
 [TITLE]
 ;; Simple 1-subcatchment → junction → outfall model
 
@@ -31,15 +41,13 @@ ROUTING_STEP            00:01:00
 RG1              INTENSITY  0:05      1.0   TIMESERIES TS1
 
 [TIMESERIES]
-;;Name   Date       Time     Value(mm/hr)
-TS1                00:00     0.0
-TS1                00:05     5.0
-TS1                00:10     15.0
-TS1                00:15     30.0
-TS1                00:20     30.0
-TS1                00:25     15.0
-TS1                00:30     5.0
-TS1                00:35     0.0
+;;Name   Date   Time     Value(mm/hr)
+TS1             00:00    0.0
+TS1             00:05    {storm_peak/3:.1f}
+TS1             00:10    {storm_peak:.1f}
+TS1             00:15    {storm_peak:.1f}
+TS1             00:20    {storm_peak/3:.1f}
+TS1             00:25    0.0
 
 [SUBCATCHMENTS]
 ;;Name     Raingage  Outlet  Area   %Imperv   Width  %Slope  CurbLen  Snowpack
@@ -77,32 +85,48 @@ NODES        ALL
 LINKS        ALL
 
 [END]
-"""
+""").strip()
 
-with open("toy_model.inp", "w") as f:
-    f.write(inp_text)
+# --- Run in a temp directory (writable in Streamlit Cloud) ---
+with TemporaryDirectory() as tmp:
+    inp_path = os.path.join(tmp, "toy_model.inp")
+    rpt_path = os.path.join(tmp, "toy_model.rpt")
+    out_path = os.path.join(tmp, "toy_model.out")
+    with open(inp_path, "w") as f:
+        f.write(inp_text)
 
-# --- 2) Run with PySWMM and access results -------------------------------
-with Simulation("toy_model.inp") as sim:
-    nodes = Nodes(sim)
-    links = Links(sim)
-    subs = Subcatchments(sim)
+    st.code(f"Working dir: {tmp}\nFiles will be:\n{inp_path}\n{rpt_path}\n{out_path}")
 
-    j1 = nodes["J1"]
-    c1 = links["C1"]
-    s1 = subs["S1"]
+    try:
+        with Simulation(inp_path, rpt_path, out_path) as sim:
+            nodes = Nodes(sim)
+            links = Links(sim)
+            subs = Subcatchments(sim)
+            j1 = nodes["J1"]; c1 = links["C1"]; s1 = subs["S1"]
 
-    print("time, subcatch_runoff(L/s), node_depth(m), link_flow(L/s)")
-    for step in sim:
-        print(f"{sim.current_time}, "
-              f"{s1.runoff:6.2f}, "
-              f"{j1.depth:5.3f}, "
-              f"{c1.flow:6.2f}")
+            rows = []
+            for _ in sim:
+                rows.append((str(sim.current_time), round(s1.runoff,2),
+                             round(j1.depth,3), round(c1.flow,2)))
 
-# --- 3) After run, you could also read simple totals if desired ----------
-with Simulation("toy_model.inp") as sim:
-    sim.execute()  # run once quickly just to access final stats
-    # Simple, quick aggregates (example):
-    # PySWMM exposes time-step values during iteration; for true reports,
-    # parse the .rpt file or accumulate during the loop above.
-    print("\nSimulation complete. See printed time series above.")
+        st.success("Simulation completed.")
+        st.write("time, subcatch_runoff(L/s), node_depth(m), link_flow(L/s)")
+        st.dataframe(rows, use_container_width=True)
+
+        # If the engine wrote a report, show the tail for debugging
+        if os.path.exists(rpt_path):
+            with open(rpt_path, "r", errors="ignore") as fr:
+                tail = "".join(fr.readlines()[-120:])
+            with st.expander("SWMM report tail (debug)"):
+                st.text(tail)
+
+    except Exception as e:
+        st.error("SWMM failed to open/run. See details below.")
+        st.exception(e)
+        # If an RPT was created, errors/warnings are often at the end:
+        if os.path.exists(rpt_path):
+            with open(rpt_path, "r", errors="ignore") as fr:
+                tail = "".join(fr.readlines()[-200:])
+            with st.expander("SWMM report tail (debug)"):
+                st.text(tail)
+
