@@ -1,15 +1,21 @@
 import streamlit as st
 from pyswmm import Simulation, Nodes
 import tempfile
+import os
+import datetime as dt
 
-# --- Streamlit setup ---
-st.title("💧 Simple PySWMM Simulation")
-st.write("Run a basic SWMM model directly in Streamlit.")
+st.set_page_config(page_title="PySWMM Minimal", layout="centered")
+st.title("💧 Simple PySWMM Simulation (Minimal)")
 
-# Example SWMM input (very small)
-swmm_inp = """
+st.write(
+    "This runs a tiny SWMM model (1 subcatchment → 1 junction → outfall) "
+    "and plots junction depth over time."
+)
+
+# Very small SWMM input file
+SWMM_INP = """
 [TITLE]
-;;Project Title/Notes
+;; Minimal test model
 
 [OPTIONS]
 FLOW_UNITS            CFS
@@ -35,11 +41,11 @@ Gage1            VOLUME    0:05     1.0  TIMESERIES Rain1
 
 [TIMESERIES]
 ;;Name           Date       Time     Value
-Rain1                         0:00     0.0
-Rain1                         0:30     0.2
-Rain1                         1:00     0.4
-Rain1                         1:30     0.0
-Rain1                         2:00     0.0
+Rain1                         00:00     0.0
+Rain1                         00:30     0.2
+Rain1                         01:00     0.4
+Rain1                         01:30     0.0
+Rain1                         02:00     0.0
 
 [SUBCATCHMENTS]
 ;;Name   Raingage   Outlet   Area   %Imperv  Width  Slope  CurbLen  SnowPack
@@ -79,20 +85,44 @@ LINKS ALL
 [END]
 """
 
-# Write temporary SWMM input file
-with tempfile.NamedTemporaryFile(delete=False, suffix=".inp") as tmp:
-    tmp.write(swmm_inp.encode())
-    tmp_path = tmp.name
+st.code("Python interpreter must be 3.10 or 3.11 for swmm-toolkit wheels.", language="text")
 
-if st.button("▶ Run Simulation"):
-    st.write("Running simulation... please wait.")
-    times, depths = [], []
-    with Simulation(tmp_path) as sim:
-        node = Nodes(sim)["J1"]
-        for step in sim:
-            times.append(sim.current_time)
-            depths.append(node.depth)
+run = st.button("▶ Run Simulation")
 
-    st.line_chart(depths)
-    st.success("✅ Simulation complete!")
+if run:
+    try:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            inp_path = os.path.join(tmpdir, "model.inp")
+            rpt_path = os.path.join(tmpdir, "model.rpt")
+            out_path = os.path.join(tmpdir, "model.out")
 
+            with open(inp_path, "w") as f:
+                f.write(SWMM_INP)
+
+            st.info("Running SWMM…")
+            times = []
+            depths = []
+
+            # Explicitly pass report/output so the toolkit can write files
+            with Simulation(inp_path, rpt_path, out_path) as sim:
+                node = Nodes(sim)["J1"]
+                for _ in sim:
+                    # current_time is a datetime; use string to chart easily
+                    times.append(sim.current_time.strftime("%H:%M"))
+                    depths.append(node.depth)
+
+            # Show results
+            st.subheader("J1 Depth over time")
+            st.line_chart({"Depth (ft)": depths}, x=times)
+            st.success("✅ Simulation complete")
+
+            with open(rpt_path, "r", errors="ignore") as f:
+                rpt_preview = "".join(list(f)[:80])
+            st.expander("Report preview").write(rpt_preview)
+
+    except Exception as e:
+        st.error(
+            "SWMM failed to open/run. The most common cause is an **unsupported Python "
+            "version** for `swmm-toolkit`. Make sure you are on Python 3.10 or 3.11."
+        )
+        st.exception(e)
