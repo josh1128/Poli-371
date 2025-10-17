@@ -3,3 +3,5 @@ numpy
 matplotlib
 folium
 streamlit-folium
+phydrus
+pandas
