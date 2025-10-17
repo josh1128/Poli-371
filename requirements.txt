@@ -4,3 +4,4 @@ matplotlib
 folium
 streamlit-folium
 pyswmm
+swmm-toolkit==0.9.0
