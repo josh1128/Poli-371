@@ -7,3 +7,4 @@ hydrobricks==0.8.5
 pandas>=2.2
 numpy>=1.26
 xarray
+pyet>=1.4.0
